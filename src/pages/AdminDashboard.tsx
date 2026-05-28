@@ -6,7 +6,7 @@ import * as pdfjsLib from 'pdfjs-dist';
 import mammoth from 'mammoth';
 import { 
   FileText, Database, Activity, ShieldAlert, Settings, 
-  Plus, Check, Trash, Upload, Search, Users, AlertTriangle, Play, Edit, ScanText, FileQuestion, BookOpen, UserCheck, LayoutDashboard, CloudUpload, Key, Headset, Send, X, Bot, MessageCircle, RefreshCw, UploadCloud, DownloadCloud, LogOut
+  Plus, Check, Trash, Upload, Search, Users, AlertTriangle, Play, Edit, ScanText, FileQuestion, BookOpen, UserCheck, LayoutDashboard, CloudUpload, Key, Headset, Send, X, Bot, MessageCircle, RefreshCw, UploadCloud, DownloadCloud, LogOut, Eye, EyeOff
 } from 'lucide-react';
 
 // @ts-ignore
@@ -15,6 +15,7 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
 
 import { db } from '@/src/lib/firebase';
 import { getSafeGenAI, reportFailedKey, generateContentWithRetry } from '@/src/lib/gemini';
+import { DEFAULT_EXTRACT_KEYS, DEFAULT_CHAT_KEYS } from '@/src/lib/defaultKeys';
 import { safeJsonParseArray } from '@/src/lib/jsonRepair';
 import { collection, getDocs, addDoc, updateDoc, deleteDoc, doc, serverTimestamp, setDoc, getDoc, query, orderBy, onSnapshot, Timestamp, writeBatch } from 'firebase/firestore';
 import { useAuth } from '../context/AuthContext';
@@ -169,6 +170,8 @@ export default function AdminDashboard() {
   const [chatKeysUsage, setChatKeysUsage] = useState<Record<string, number>>({});
   const [newExtractKey, setNewExtractKey] = useState('');
   const [newChatKey, setNewChatKey] = useState('');
+  const [envKey, setEnvKey] = useState<string | null>(null);
+  const [allEnvKeys, setAllEnvKeys] = useState<string[]>([]);
 
   // Manual Draft State
   const [showManualForm, setShowManualForm] = useState(false);
@@ -276,6 +279,27 @@ export default function AdminDashboard() {
           setChatKeys(ckSnap.data().keys || []); 
           setChatKeysUsage(ckSnap.data().usage || {});
       }
+      
+      try {
+          const geminiKey = import.meta.env?.VITE_GEMINI_API_KEY || '';
+          if (geminiKey) setEnvKey(geminiKey);
+          
+          if (geminiKey) {
+              setAllEnvKeys([geminiKey]);
+          }
+          
+          setExtractKeys(prev => {
+              const combined = [...new Set([...prev, ...(geminiKey ? [geminiKey] : []), ...DEFAULT_EXTRACT_KEYS])];
+              return combined.sort();
+          });
+          setChatKeys(prev => {
+              const combined = [...new Set([...prev, ...(geminiKey ? [geminiKey] : []), ...DEFAULT_CHAT_KEYS])];
+              return combined.sort();
+          });
+      } catch(e) {
+          setExtractKeys(prev => [...new Set([...prev, ...DEFAULT_EXTRACT_KEYS])]);
+          setChatKeys(prev => [...new Set([...prev, ...DEFAULT_CHAT_KEYS])]);
+      }
 
     } catch (err) {
       console.error(err);
@@ -358,7 +382,7 @@ CRITICAL RULES:
       }
 
       const response = await generateContentWithRetry('extract', {
-        model: "gemini-1.5-flash",
+        model: "gemini-2.5-flash",
         contents: [
             { role: "user", parts: userParts }
         ],
@@ -389,7 +413,7 @@ Difficulty Level: ${questionDifficulty}.
 Additional User Instructions: ${extraInstructions}
 CRITICAL RULES:
 1. Questions and choices (A,B,C,D) MUST be in English.
-2. Explanations should follow user instructions, defaulting to Egyptian Arabic if not specified differently, and cite the source.
+2. Explanations should follow user instructions, defaulting to Egyptian Arabic if not specified differently. The explanation MUST include the exact source page number from the provided text or document if available (e.g., 'Source: Page X').
 3. DO NOT make the correct answer longer or shorter than the other options.
 4. DO NOT add brackets or any hints that distinguish the correct answer.
 5. Return the result STRICTLY as a JSON array. Structure:
@@ -398,7 +422,7 @@ CRITICAL RULES:
     "text": "The English question text",
     "options": ["Option A", "Option B", "Option C", "Option D"],
     "correct": 0,
-    "explanation": "شرح التفسير"
+    "explanation": "شرح التفسير، المصدر: صفحة X"
   }
 ]`;
 
@@ -414,7 +438,7 @@ CRITICAL RULES:
       }
 
       const response = await generateContentWithRetry('extract', {
-        model: "gemini-1.5-flash",
+        model: "gemini-2.5-flash",
         contents: [
             { role: "user", parts: userParts }
         ],
@@ -607,8 +631,8 @@ CRITICAL RULES:
 
   const createBank = () => {
     setPromptDialog({ message: 'اسم البنك أو القسم:', defaultValue: '', onConfirm: async (name) => {
-      const res = await addDoc(collection(db, 'banks'), { name, createdAt: serverTimestamp() });
-      setBanks(prev => [...prev, { id: res.id, name }]);
+      const res = await addDoc(collection(db, 'banks'), { name, createdAt: serverTimestamp(), isPublished: false });
+      setBanks(prev => [...prev, { id: res.id, name, isPublished: false }]);
       notifyAdmins();
     }});
   };
@@ -705,28 +729,32 @@ CRITICAL RULES:
   };
 
   const bulkDeleteDrafts = async () => {
-    if(!confirm(`هل أنت متأكد من حذف ${selectedDrafts.length} مسودة؟`)) return;
-    setLoading(true);
-    try {
-      const chunks = [];
-      for (let i = 0; i < selectedDrafts.length; i += 400) {
-        chunks.push(selectedDrafts.slice(i, i + 400));
-      }
-      for (const chunk of chunks) {
-        const batch = writeBatch(db);
-        for (const id of chunk) {
-          batch.delete(doc(db, 'drafts', id));
+    setConfirmDialog({
+      message: `هل أنت متأكد من حذف ${selectedDrafts.length} مسودة؟`,
+      onConfirm: async () => {
+        setLoading(true);
+        try {
+          const chunks = [];
+          for (let i = 0; i < selectedDrafts.length; i += 400) {
+            chunks.push(selectedDrafts.slice(i, i + 400));
+          }
+          for (const chunk of chunks) {
+            const batch = writeBatch(db);
+            for (const id of chunk) {
+              batch.delete(doc(db, 'drafts', id));
+            }
+            await batch.commit();
+          }
+          setDrafts(prev => prev.filter(d => !selectedDrafts.includes(d.id)));
+          setSelectedDrafts([]);
+        } catch (err) {
+          console.error(err);
+          alert('فشل الحذف');
+        } finally {
+          setLoading(false);
         }
-        await batch.commit();
       }
-      setDrafts(prev => prev.filter(d => !selectedDrafts.includes(d.id)));
-      setSelectedDrafts([]);
-    } catch (err) {
-      console.error(err);
-      alert('فشل الحذف');
-    } finally {
-      setLoading(false);
-    }
+    });
   };
 
   const bulkPublishDrafts = async (targetBankId: string) => {
@@ -770,51 +798,66 @@ CRITICAL RULES:
     }
   };
 
+  const togglePublishBank = async (bankId: string, currentStatus: boolean) => {
+      try {
+          await updateDoc(doc(db, 'banks', bankId), { isPublished: !currentStatus });
+          setBanks(banks.map(b => b.id === bankId ? { ...b, isPublished: !currentStatus } : b));
+          toast.success(!currentStatus ? 'تم النشر للمستخدمين بنجاح!' : 'تم التخفي وإلغاء النشر بنجاح!');
+          notifyAdmins();
+      } catch (e) {
+          console.error(e);
+          toast.error('حدث خطأ أثناء تغيير حالة النشر.');
+      }
+  };
+
   const publishEntireDraftBank = async (targetBankId: string) => {
     if (!targetBankId) return alert('الرجاء اختيار المجلد المستهدف');
     const bName = banks.find(b => b.id === targetBankId)?.name || '';
-    if (!confirm(`هل أنت متأكد من نشر جميع مسودات المجلد "${bName}" للطلاب؟`)) return;
-    
-    setLoading(true);
-    try {
-      const draftsToPublish = drafts.filter(d => d.bankId === targetBankId);
-      if (draftsToPublish.length === 0) {
-        alert("لا توجد مسودات منسوبة لهذا المجلد!");
-        setLoading(false);
-        return;
-      }
-      
-      const chunks = [];
-      for (let i = 0; i < draftsToPublish.length; i += 400) {
-          chunks.push(draftsToPublish.slice(i, i + 400));
-      }
-
-      for (const chunk of chunks) {
-          const batch = writeBatch(db);
-          for (const draft of chunk) {
-              const liveRef = doc(collection(db, 'live_banks'));
-              batch.set(liveRef, { 
-                bankId: targetBankId,
-                text: draft.text,
-                options: draft.options,
-                correct: draft.correct,
-                explanation: draft.explanation || '',
-                imageUrl: draft.imageUrl || '',
-                createdAt: serverTimestamp()
-              });
-              batch.delete(doc(db, 'drafts', draft.id));
+    setConfirmDialog({
+      message: `هل أنت متأكد من نشر جميع مسودات المجلد "${bName}" للطلاب؟`,
+      onConfirm: async () => {
+        setLoading(true);
+        try {
+          const draftsToPublish = drafts.filter(d => d.bankId === targetBankId);
+          if (draftsToPublish.length === 0) {
+            alert("لا توجد مسودات منسوبة لهذا المجلد!");
+            setLoading(false);
+            return;
           }
-          await batch.commit();
+          
+          const chunks = [];
+          for (let i = 0; i < draftsToPublish.length; i += 400) {
+              chunks.push(draftsToPublish.slice(i, i + 400));
+          }
+
+          for (const chunk of chunks) {
+              const batch = writeBatch(db);
+              for (const draft of chunk) {
+                  const liveRef = doc(collection(db, 'live_banks'));
+                  batch.set(liveRef, { 
+                    bankId: targetBankId,
+                    text: draft.text,
+                    options: draft.options,
+                    correct: draft.correct,
+                    explanation: draft.explanation || '',
+                    imageUrl: draft.imageUrl || '',
+                    createdAt: serverTimestamp()
+                  });
+                  batch.delete(doc(db, 'drafts', draft.id));
+              }
+              await batch.commit();
+          }
+          
+          alert('تم نشر المجلد بالكامل ومتاح للطلاب الآن!');
+          fetchData();
+          notifyAdmins();
+        } catch (err) {
+          console.error(err);
+          alert('حدث خطأ أثناء النشر');
+        }
+        setLoading(false);
       }
-      
-      alert('تم نشر المجلد بالكامل ومتاح للطلاب الآن!');
-      fetchData();
-      notifyAdmins();
-    } catch (err) {
-      console.error(err);
-      alert('حدث خطأ أثناء النشر');
-    }
-    setLoading(false);
+    });
   };
 
   const bulkDeleteLiveQsAction = () => {
@@ -885,14 +928,14 @@ CRITICAL RULES:
           try {
               const systemInstruction = `You are an expert medical exam creator. Extract ALL MCQ questions from the provided text or document.
 The questions and choices MUST be in English.
-The explanation MUST be in friendly Egyptian Arabic, and MUST end with a citation of the exact source page/section from the uploaded document.
+The explanation MUST be in friendly Egyptian Arabic. You MUST find and include the exact source page number from the uploaded document in the explanation. Do NOT invent page numbers.
 Output MUST be a JSON array of objects without markdown blocks. Do NOT return \`\`\`json. Structure:
 [
   {
     "text": "The English question text",
     "options": ["Option A", "Option B", "Option C", "Option D"],
     "correct": 0,
-    "explanation": "Explanation in friendly Egyptian Arabic, ending with Source: Page X."
+    "explanation": "شرح مبسط بالمصري، المصدر: صفحة X"
   }
 ]`;
                 const parts: any[] = [{ text: systemInstruction }];
@@ -903,7 +946,7 @@ Output MUST be a JSON array of objects without markdown blocks. Do NOT return \`
                 }
 
                 const response = await generateContentWithRetry('extract', {
-                  model: "gemini-1.5-flash",
+                  model: "gemini-2.5-flash",
                   contents: [{ role: "user", parts }],
                   config: { responseMimeType: "application/json" }
                 });
@@ -1008,7 +1051,7 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
                 }
 
                 const response = await generateContentWithRetry('extract', {
-                  model: "gemini-1.5-flash",
+                  model: "gemini-2.5-flash",
                   contents: [
                       { role: "user", parts }
                   ],
@@ -1109,21 +1152,43 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
   };
 
   const handleRemoveApiKey = async (feature: 'extract' | 'chat', key: string) => {
-      if (!confirm('حذف المفتاح نهائياً؟')) return;
-      try {
-          const docRef = doc(db, 'api_keys', feature);
-          const snap = await getDoc(docRef);
-          if (snap.exists()) {
-              let currentKeys = snap.data().keys || [];
-              currentKeys = currentKeys.filter((k: string) => k !== key);
-              await setDoc(docRef, { keys: currentKeys }, { merge: true });
-              if (feature === 'extract') setExtractKeys(currentKeys);
-              else setChatKeys(currentKeys);
+      setConfirmDialog({
+          message: 'حذف المفتاح نهائياً؟',
+          onConfirm: async () => {
+              try {
+                  const docRef = doc(db, 'api_keys', feature);
+                  const snap = await getDoc(docRef);
+                  if (snap.exists()) {
+                      let currentKeys = snap.data().keys || [];
+                      currentKeys = currentKeys.filter((k: string) => k !== key);
+                      await setDoc(docRef, { keys: currentKeys }, { merge: true });
+                      if (feature === 'extract') setExtractKeys(currentKeys);
+                      else setChatKeys(currentKeys);
+                  }
+              } catch (e) {
+                  console.error(e);
+                  alert('فشل الحذف');
+              }
           }
-      } catch (e) {
-          console.error(e);
-          alert('فشل الحذف');
-      }
+      });
+  };
+
+  const handleDeleteAllKeys = async (feature: 'extract' | 'chat') => {
+      setConfirmDialog({ 
+          message: 'هل أنت متأكد من حذف جميع المفاتيح؟ لا يمكن التراجع عن هذا الإجراء.', 
+          onConfirm: async () => {
+              try {
+                  const docRef = doc(db, 'api_keys', feature);
+                  await setDoc(docRef, { keys: [], usage: {}, currentIndex: 0 }, { merge: false });
+                  if (feature === 'extract') setExtractKeys([]);
+                  else setChatKeys([]);
+                  alert('تم حذف جميع المفاتيح بنجاح');
+              } catch (e) {
+                  console.error(e);
+                  alert('حدث خطأ أثناء حذف المفاتيح');
+              }
+          }
+      });
   };
 
   const handleCreateManualDraft = async () => {
@@ -1164,6 +1229,61 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
           await setDoc(doc(db, 'admin_system', 'global_settings'), updates, { merge: true });
           alert('تم التحديث بنجاح!');
       } catch(e) { console.error(e); }
+  };
+
+  const factoryResetSite = async () => {
+      setConfirmDialog({ message: 'تحذير خطير جداً: هل أنت متأكد من تصفير الموقع بالكامل؟ سيتم مسح جميع البنوك، الأسئلة، المسودات، نتائج الطلاب، والمستخدمين ليعود الموقع جديداً كلياً!', onConfirm: async () => {
+          setLoading(true);
+          try {
+             const allDocsToDelete: object[] = [];
+             
+             const feedbackSnap = await getDocs(collection(db, 'exam_feedback'));
+             const feedbackDocs = feedbackSnap.docs.map(d => ({ col: 'exam_feedback', id: d.id }));
+             allDocsToDelete.push(...users.map(u => ({ col: 'users', id: u.id })));
+             allDocsToDelete.push(...strikes.map(s => ({ col: 'strikes', id: s.id })));
+             allDocsToDelete.push(...examResults.map(r => ({ col: 'exam_results', id: r.id })));
+             allDocsToDelete.push(...feedbackDocs);
+             
+             allDocsToDelete.push(...banks.map(b => ({ col: 'banks', id: b.id })));
+             allDocsToDelete.push(...liveQuestions.map(q => ({ col: 'live_banks', id: q.id })));
+             allDocsToDelete.push(...drafts.map(d => ({ col: 'questions', id: d.id })));
+             
+             const chatSnap = await getDocs(collection(db, 'chat_history'));
+             allDocsToDelete.push(...chatSnap.docs.map(d => ({ col: 'chat_history', id: d.id })));
+             
+             const supportSnap = await getDocs(collection(db, 'pending_support_chats'));
+             allDocsToDelete.push(...supportSnap.docs.map(d => ({ col: 'pending_support_chats', id: d.id })));
+             
+             allDocsToDelete.push({ col: 'admin_system', id: 'global_settings' });
+
+             const chunks = [];
+             for (let i = 0; i < allDocsToDelete.length; i += 400) {
+               chunks.push(allDocsToDelete.slice(i, i + 400));
+             }
+
+             for (const chunk of chunks) {
+                const batch = writeBatch(db);
+                for (const item of chunk) {
+                   batch.delete(doc(db, (item as any).col, (item as any).id));
+                }
+                await batch.commit();
+             }
+
+             setUsers([]);
+             setStrikes([]);
+             setExamResults([]);
+             setBanks([]);
+             setLiveQuestions([]);
+             setDrafts([]);
+             
+             toast.success("تم ضبط المصنع للموقع بنجاح!");
+          } catch(err: any) {
+             console.error("Factory reset failed", err);
+             toast.error(`فشل ضبط المصنع: ${err?.message || err}`);
+          } finally {
+             setLoading(false);
+          }
+      }});
   };
 
   const resetAllStudentData = async () => {
@@ -1272,21 +1392,25 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
 
               <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
                  <h2 className="text-2xl font-bold border-b-2 border-[#D4AF37] pb-2 inline-block">نظرة عامة (Overview)</h2>
-                 <div className="flex items-center gap-2">
-                     <button onClick={async () => {
-                        try {
-                            await setDoc(doc(db, 'admin_system', 'global_settings'), {
-                                force_logout_timestamp: Date.now()
-                            }, { merge: true });
-                            alert('تم إرسال أمر الطرد التلقائي لجميع الأجهزة!');
-                        } catch(e) { console.error(e); }
-                     }} className="bg-orange-50 hover:bg-orange-100 text-orange-600 border border-orange-200 px-4 py-2 rounded-xl text-sm font-bold shadow-sm flex items-center gap-2 transition-colors">
-                        <LogOut size={16} /> طرد الجميع لمواجهة التسجيل
-                     </button>
-                     <button onClick={resetAllStudentData} className="bg-red-50 hover:bg-red-100 text-red-600 border border-red-200 px-4 py-2 rounded-xl text-sm font-bold shadow-sm flex items-center gap-2 transition-colors">
-                        <Trash size={16} /> تصفير معلومات جميع الطلاب
-                     </button>
-                 </div>
+                 <div className="flex flex-wrap items-center gap-2">
+                     <button onClick={() => setConfirmDialog({ message: 'هل أنت متأكد من طرد جميع الطلاب فوراً لإجراء التحديثات؟', onConfirm: async () => {
+                            try {
+                                await setDoc(doc(db, 'admin_system', 'global_settings'), {
+                                    force_logout_timestamp: Date.now()
+                                }, { merge: true });
+                                
+                                toast.success('تم إرسال أمر الطرد التلقائي لجميع الأجهزة!');
+                            } catch(e) { console.error(e); }
+                         }})} className="bg-orange-50 hover:bg-orange-100 text-orange-600 border border-orange-200 px-4 py-2 rounded-xl text-sm font-bold shadow-sm flex items-center gap-2 transition-colors">
+                            <LogOut size={16} /> طرد الجميع
+                         </button>
+                         <button onClick={resetAllStudentData} className="bg-red-50 hover:bg-red-100 text-red-600 border border-red-200 px-4 py-2 rounded-xl text-sm font-bold shadow-sm flex items-center gap-2 transition-colors">
+                            <Trash size={16} /> تصفير الطلاب
+                         </button>
+                         <button onClick={factoryResetSite} className="bg-red-600 hover:bg-red-700 text-white border border-red-600 px-4 py-2 rounded-xl text-sm font-bold shadow-sm flex items-center gap-2 transition-colors">
+                            <Trash size={16} /> ضبط المصنع
+                         </button>
+                     </div>
               </div>
 
               {/* GLOBAL SETTINGS UI */}
@@ -1890,10 +2014,13 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
                           نشر ({pendingDrafts}) مسودة 🚀
                         </button>
                      ) : (
-                        <label className="cursor-pointer text-white bg-[#D4AF37] hover:bg-[#C5A059] px-3 py-1.5 rounded-lg text-xs font-bold transition-colors w-full text-center flex items-center justify-center gap-1 shadow-sm mt-2">
-                            <CloudUpload size={12}/> رفع بنك كلي
-                            <input type="file" accept=".txt,.md,.pdf,.docx" className="hidden" onChange={(e) => uploadFullBankToFolder(e, bank.id)} />
-                        </label>
+                        <button 
+                          onClick={() => togglePublishBank(bank.id, !!bank.isPublished)}
+                          className={`w-full px-3 py-1.5 rounded-lg text-xs font-bold transition-colors text-center flex items-center justify-center gap-1 shadow-sm mt-2 ${bank.isPublished ? 'bg-red-600 hover:bg-red-700 text-white' : 'bg-green-600 hover:bg-green-700 text-white'}`}
+                        >
+                           {bank.isPublished ? <EyeOff size={12}/> : <Eye size={12}/>}
+                           {bank.isPublished ? 'إلغاء הנشر للمستخدمين' : 'نشر للمستخدمين'}
+                        </button>
                      )}
                      
                      <button 
@@ -2302,7 +2429,6 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
                 </div>
 
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                   {/* Banned Users */}
                    <div className="bg-white rounded-3xl border border-gray-100 shadow-sm p-6 overflow-hidden">
                       <h3 className="font-bold text-gray-800 text-lg mb-4 flex items-center gap-2">
                          <ShieldAlert className="text-red-500" size={20}/>
@@ -2393,17 +2519,56 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
 
           {/* API KEYS TAB */}
           {!loading && activeTab === 'api_keys' && (
-              <div className="space-y-6">
+              <div className="space-y-6 animate-fadeIn">
                 <h2 className="text-2xl font-bold border-b-2 border-[#D4AF37] pb-2 inline-block flex items-center gap-2"><Key className="text-[#D4AF37] inline mr-2" size={24} /> نظام تدوير المفاتيح (API Key Manager)</h2>
-                <div className="bg-blue-50 border border-blue-200 p-4 rounded-xl text-blue-800 text-sm font-bold flex items-center gap-3">
-                   <span>ℹ️</span> 
-                   يضمن هذا النظام استمرار عمل المنصة بدون توقف. إذا استهلك مفتاح باقته بالكامل، سيتم التحويل للمفتاح الذي يليه تلقائياً وبشكل مخفي عن الطلاب.
+                
+                <div className="bg-red-50 text-red-800 p-5 rounded-2xl border border-red-200 shadow-sm">
+                     <h3 className="font-bold mb-3 flex items-center gap-2 text-lg"><AlertTriangle size={20}/> 10 حلول مقترحة لتفادي مشاكل فشل الاتصال (عوضاً عن Unexpected token)</h3>
+                     <ul className="list-disc list-inside text-sm space-y-1.5 font-medium pr-2">
+                         <li>تأكد من عدم رفع ملف PDF يتجاوز حجمه 1-2 ميجابايت (الاستضافة قد ترفض الملفات الكبيرة وتقطع الاتصال).</li>
+                         <li>بدلاً من رفع PDF، انسخ النص والصقه مباشرة في صندوق النص للحصول على نسبة نجاح 100%.</li>
+                         <li>مفاتيح الذكاء الاصطناعي معرّضة للحظر إن كانت مسروقة، استخدم مفاتيحك الخاصة دائماً.</li>
+                         <li>أضف المزيد من المفاتيح الرديفة في المربعات بالأسفل لتوزيع الضغط (Load Balancing).</li>
+                         <li>تأكد أن المفاتيح صالحة ولم تنتهِ حصتها المجانية من Google AI Studio.</li>
+                         <li>في حالة انقطاع الإنترنت أو مشكلة الشبكة المتقطعة، أغلق الصفحة وافتحها مجدداً.</li>
+                         <li>تأكد من نسخ المفتاح كاملاً بدون رموز دخيلة (مسافات فارغة بالبداية أو النهاية).</li>
+                         <li>راقب حالة المفتاح الأساسي بالأسفل، إذا كان "غير متوفر"، تأكد من إعداد الملفات البيئية <code className="bg-red-100 px-1 rounded">.env</code>.</li>
+                         <li>استخدم خطة مدفوعة في Google Cloud إذا كان الضغط على الموقع عالياً جداً.</li>
+                         <li>تأكد من اختيار المجلد (Bank) الصحيح بالمسودات قبل البدء، لتجنب حدوث خلل برمجي.</li>
+                     </ul>
+                 </div>
+
+                 <div className="bg-blue-50 text-blue-900 p-5 rounded-2xl border border-blue-200 font-bold shadow-sm flex flex-col gap-2">
+                     <div className="flex items-center gap-2 text-lg">
+                        <Key size={18} className="text-blue-600"/>
+                        المفتاح الأساسي للبيئة (Environment API Key):
+                     </div>
+                     <span className="font-mono text-sm block mt-1 tracking-wider bg-white px-3 py-2 rounded-lg border border-blue-100 break-all select-all text-left" dir="ltr">
+                         {envKey ? envKey : "غير متوفر (لم يتم ضبط GEMINI_API_KEY). الموقع سيعتمد على هذه القائمة فقط."}
+                     </span>
+                 </div>
+
+                <div className="bg-blue-50 border border-blue-200 p-4 rounded-xl text-blue-800 text-sm flex flex-col gap-2">
+                   <div className="flex items-center gap-2 font-bold">
+                       <span>ℹ️</span> 
+                       يضمن هذا النظام استمرار عمل المنصة بدون توقف.
+                   </div>
+                   <p className="text-xs mr-6">
+                       <strong>لإضافة مفاتيح من الاستضافة (مستحسن وأكثر أماناً):</strong>
+                       <br />
+                       توجه إلى لوحة تحكم الاستضافة (Vercel/Render أو غيرها) وقم بإضافة متغيرات في قسم Environment Variables بحيث تبدأ بكلمة <code>GEMINI_API_KEY</code>
+                       <br />
+                       مثال: <code>GEMINI_API_KEY_1</code> = (مفتاحك الأول)، <code>GEMINI_API_KEY_2</code> = (مفتاحك الثاني)، وسيتم سحبها واستخدامها تلقائياً.
+                   </p>
                 </div>
 
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-8 mt-6">
                    {/* Extract Keys */}
                    <div className="bg-white rounded-2xl border border-gray-200 shadow-sm p-6">
-                      <h3 className="text-lg font-bold text-gray-800 mb-4 border-b border-gray-100 pb-3 flex items-center gap-2"><ScanText size={20} className="text-[#D4AF37]"/> مفاتيح استخراج الأسئلة</h3>
+                      <div className="flex justify-between items-center mb-4 border-b border-gray-100 pb-3">
+                         <h3 className="text-lg font-bold text-gray-800 flex items-center gap-2"><ScanText size={20} className="text-[#D4AF37]"/> مفاتيح استخراج الأسئلة</h3>
+                         <button onClick={() => handleDeleteAllKeys('extract')} className="text-xs text-red-600 hover:text-red-800 font-bold bg-red-50 hover:bg-red-100 px-3 py-1.5 rounded-lg transition-colors flex items-center gap-1">حذف الكل <Trash size={12}/></button>
+                      </div>
                       <div className="flex gap-2 mb-6">
                           <input 
                               value={newExtractKey}
@@ -2413,22 +2578,16 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
                               dir="ltr"
                           />
                           <button onClick={() => handleAddApiKey('extract', newExtractKey)} className="bg-[#1A1A1A] hover:bg-black text-white px-4 rounded-xl text-sm font-bold shadow-md">+</button>
-                          <button onClick={async () => {
-                             const batch = ["AIzaSyByAI-G5-YMXTxWtKl95Hb4vVgWnuzaoDI", "AIzaSyDTkoLORzrCO4cTafc7QGlrtGpJ9GoOEJ4", "AIzaSyCo_6_eLCNz2OPiBx17TZpdoJJUd4mlDLU", "AIzaSyDRwlWRVuUCvj5lAadN_cqux_zN-WCg_ZU", "AIzaSyDibCDZ2q95gTP3g2hbhEYDYTmLafhQ9z0", "AIzaSyA32uQYMnHnTQiZLvsUcZ-cHIlidpco5eQ", "AIzaSyCtFeYF9CCNcZ_Exf6JhE5-arMEEAf20vw", "AIzaSyBX3Yk7kSIpdFpsDc7DTFm1oPqa0fVT1Mg", "AIzaSyB9yPQUC_HubFxTyuHKjIF9dhKClj6wox4", "AIzaSyBjlrlw89-hIdegaPfrKykZeWp_7NjOeoI", "AIzaSyDZu5Yz3cn5CTDDTalbTdwIZrlsi4GcL1Y", "AIzaSyDzrh8XieUV_pUFBu0fdovFYAUL_r1NDp8", "AIzaSyAEhAQpr5Pf3YJ8F--NIyCeczjs3WxAXKo", "AIzaSyDMieLans2dIyqIL7WOLC9B-Kt-GS5x0-c", "AIzaSyDlpGJe1KPVtj8u6-bb33gzZbYNWlgspKI", "AIzaSyDNEEzT1bYMQWIo2ZwkBn5MVJg_6LpZwaY", "AIzaSyAe6zhamy6IPPkmGm7Ajhs9Ie4_PY1tlRI", "AIzaSyD1CHSQs6vMa0B-sJUXzDoaqqOzwlXvMRI", "AIzaSyB0MbzM3xxEvwjVPyivjIxl6_cx2BwZP7c", "AIzaSyC7YoZ2SKlVv9gOMoIH4QbeQeKsJ-k5ors", "AIzaSyAlRzN5fhGmZWACzhJz6jNOQDMppsAypRE", "AIzaSyDLStYZbMJVXFtHLGyCu1PfwEZEgJIF_p8", "AIzaSyCRxOAbjZSIEi6iP8Tuxp_bLGQaFz3oyco", "AIzaSyBTmXn2XPOEpkLOX5rD0hY90FjtEw3g0_k", "AIzaSyCBp6CrIzqYdfo7rrlz5xjHZCsZU6fOweA"];
-                             setConfirmDialog({ message: 'إضافة 25 مفتاح تجريبي لاستخراج الأسئلة؟', onConfirm: async () => {
-                                await handleAddApiKeysBatch('extract', batch);
-                             }});
-                          }} className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-2 rounded-xl text-xs font-bold shadow-md transition-colors whitespace-nowrap hidden md:block">إضافة تجارب +</button>
                       </div>
                       <div className="space-y-3">
                           {extractKeys.length === 0 && <p className="text-gray-400 text-sm font-bold text-center py-4">لا توجد مفاتيح مسجلة. سيتم استخدام المفتاح الأساسي.</p>}
                           {extractKeys.map((k, idx) => (
                               <div key={idx} className="flex justify-between items-center bg-gray-50 border border-gray-100 p-3 rounded-xl">
-                                  <div className="flex flex-col gap-1">
-                                      <span className="font-mono text-xs text-gray-600 truncate max-w-[200px]" dir="ltr">{k.substring(0, 10)}...{k.substring(k.length - 4)}</span>
+                                  <div className="flex flex-col gap-1 w-full overflow-hidden px-2">
+                                      <span className="font-mono text-xs text-gray-800 break-all select-all" dir="ltr">{k}</span>
                                       <span className="text-[10px] font-bold text-[#D4AF37]">الاستخدام: {extractKeysUsage[k] || 0} مرة</span>
                                   </div>
-                                  <button onClick={() => handleRemoveApiKey('extract', k)} className="text-red-500 hover:text-red-700 bg-red-50 p-1.5 rounded-lg"><Trash size={14}/></button>
+                                  <button onClick={() => handleRemoveApiKey('extract', k)} className="text-red-500 hover:text-red-700 bg-red-50 p-1.5 rounded-lg shrink-0"><Trash size={14}/></button>
                               </div>
                           ))}
                       </div>
@@ -2436,7 +2595,10 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
 
                    {/* Chat Keys */}
                    <div className="bg-white rounded-2xl border border-gray-200 shadow-sm p-6">
-                      <h3 className="text-lg font-bold text-gray-800 mb-4 border-b border-gray-100 pb-3 flex items-center gap-2"><FileQuestion size={20} className="text-[#D4AF37]"/> مفاتيح شات الطلاب و تعرف تذاكر ايه</h3>
+                      <div className="flex justify-between items-center mb-4 border-b border-gray-100 pb-3">
+                         <h3 className="text-lg font-bold text-gray-800 flex items-center gap-2"><FileQuestion size={20} className="text-[#D4AF37]"/> مفاتيح شات الطلاب</h3>
+                         <button onClick={() => handleDeleteAllKeys('chat')} className="text-xs text-red-600 hover:text-red-800 font-bold bg-red-50 hover:bg-red-100 px-3 py-1.5 rounded-lg transition-colors flex items-center gap-1">حذف الكل <Trash size={12}/></button>
+                      </div>
                       <div className="flex gap-2 mb-6">
                           <input 
                               value={newChatKey}
@@ -2446,22 +2608,16 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
                               dir="ltr"
                           />
                           <button onClick={() => handleAddApiKey('chat', newChatKey)} className="bg-[#1A1A1A] hover:bg-black text-white px-4 rounded-xl text-sm font-bold shadow-md">+</button>
-                          <button onClick={async () => {
-                             const batch = ["AIzaSyByAI-G5-YMXTxWtKl95Hb4vVgWnuzaoDI", "AIzaSyDTkoLORzrCO4cTafc7QGlrtGpJ9GoOEJ4", "AIzaSyCo_6_eLCNz2OPiBx17TZpdoJJUd4mlDLU", "AIzaSyDRwlWRVuUCvj5lAadN_cqux_zN-WCg_ZU", "AIzaSyDibCDZ2q95gTP3g2hbhEYDYTmLafhQ9z0", "AIzaSyA32uQYMnHnTQiZLvsUcZ-cHIlidpco5eQ", "AIzaSyCtFeYF9CCNcZ_Exf6JhE5-arMEEAf20vw", "AIzaSyBX3Yk7kSIpdFpsDc7DTFm1oPqa0fVT1Mg", "AIzaSyB9yPQUC_HubFxTyuHKjIF9dhKClj6wox4", "AIzaSyBjlrlw89-hIdegaPfrKykZeWp_7NjOeoI", "AIzaSyDZu5Yz3cn5CTDDTalbTdwIZrlsi4GcL1Y", "AIzaSyDzrh8XieUV_pUFBu0fdovFYAUL_r1NDp8", "AIzaSyAEhAQpr5Pf3YJ8F--NIyCeczjs3WxAXKo", "AIzaSyDMieLans2dIyqIL7WOLC9B-Kt-GS5x0-c", "AIzaSyDlpGJe1KPVtj8u6-bb33gzZbYNWlgspKI", "AIzaSyDNEEzT1bYMQWIo2ZwkBn5MVJg_6LpZwaY", "AIzaSyAe6zhamy6IPPkmGm7Ajhs9Ie4_PY1tlRI", "AIzaSyD1CHSQs6vMa0B-sJUXzDoaqqOzwlXvMRI", "AIzaSyB0MbzM3xxEvwjVPyivjIxl6_cx2BwZP7c", "AIzaSyC7YoZ2SKlVv9gOMoIH4QbeQeKsJ-k5ors", "AIzaSyAlRzN5fhGmZWACzhJz6jNOQDMppsAypRE", "AIzaSyDLStYZbMJVXFtHLGyCu1PfwEZEgJIF_p8", "AIzaSyCRxOAbjZSIEi6iP8Tuxp_bLGQaFz3oyco", "AIzaSyBTmXn2XPOEpkLOX5rD0hY90FjtEw3g0_k", "AIzaSyCBp6CrIzqYdfo7rrlz5xjHZCsZU6fOweA"];
-                             setConfirmDialog({ message: 'إضافة 25 مفتاح تجريبي للدردشة التفاعلية؟', onConfirm: async () => {
-                                await handleAddApiKeysBatch('chat', batch);
-                             }});
-                          }} className="bg-green-600 hover:bg-green-700 text-white px-3 py-2 rounded-xl text-xs font-bold shadow-md transition-colors whitespace-nowrap hidden md:block">إضافة تجارب +</button>
                       </div>
                       <div className="space-y-3">
                           {chatKeys.length === 0 && <p className="text-gray-400 text-sm font-bold text-center py-4">لا توجد مفاتيح مسجلة. سيتم استخدام المفتاح الأساسي.</p>}
                           {chatKeys.map((k, idx) => (
                               <div key={idx} className="flex justify-between items-center bg-gray-50 border border-gray-100 p-3 rounded-xl">
-                                  <div className="flex flex-col gap-1">
-                                      <span className="font-mono text-xs text-gray-600 truncate max-w-[200px]" dir="ltr">{k.substring(0, 10)}...{k.substring(k.length - 4)}</span>
+                                  <div className="flex flex-col gap-1 w-full overflow-hidden px-2">
+                                      <span className="font-mono text-xs text-gray-800 break-all select-all" dir="ltr">{k}</span>
                                       <span className="text-[10px] font-bold text-[#D4AF37]">الاستخدام: {chatKeysUsage[k] || 0} مرة</span>
                                   </div>
-                                  <button onClick={() => handleRemoveApiKey('chat', k)} className="text-red-500 hover:text-red-700 bg-red-50 p-1.5 rounded-lg"><Trash size={14}/></button>
+                                  <button onClick={() => handleRemoveApiKey('chat', k)} className="text-red-500 hover:text-red-700 bg-red-50 p-1.5 rounded-lg shrink-0"><Trash size={14}/></button>
                               </div>
                           ))}
                       </div>

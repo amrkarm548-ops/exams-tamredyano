@@ -28,6 +28,18 @@ async function startServer() {
   });
 
   // API Routes
+  app.get("/api/env-keys", (req, res) => {
+    const envKeys = Object.entries(process.env)
+        .filter(([k, v]) => k.includes('GEMINI') && v)
+        .map(([k, v]) => v!);
+        
+    res.json({ 
+        geminiApiKey: process.env.GEMINI_API_KEY || null,
+        viteGeminiApiKey: process.env.VITE_GEMINI_API_KEY || null,
+        allEnvKeys: [...new Set(envKeys)]
+    });
+  });
+
   app.post("/api/proxy-gemini", async (req, res) => {
     try {
       const { feature, request, maxRetries, initialDelayMs } = req.body;
@@ -48,7 +60,7 @@ async function startServer() {
       const { fileBase64, mimeType } = req.body;
       
       const response = await ai.models.generateContent({
-        model: "gemini-1.5-flash",
+        model: "gemini-2.5-flash",
         contents: [
             { role: "user", parts: [
                 { inlineData: { data: fileBase64, mimeType: mimeType || "application/pdf" } },
@@ -116,7 +128,7 @@ Never invent facts, numbers, or books. ONLY cite a book/page if it is explicitly
       }
 
       const response = await generateContentWithRetry('chat', {
-        model: "gemini-1.5-flash",
+        model: "gemini-2.5-flash",
         contents: [
             ...formattedHistory,
             { role: "user", parts: userParts }
@@ -177,7 +189,7 @@ Output MUST be a JSON array of objects without markdown blocks. Do NOT return \`
       }
 
       const response = await generateContentWithRetry('extract', {
-        model: "gemini-1.5-flash",
+        model: "gemini-2.5-flash",
         contents: [
             { role: "user", parts: userParts }
         ],
@@ -231,7 +243,7 @@ Provide a VERY CONCISE, bulleted summary of WHAT concepts they need to study bas
 CRITICAL: DO NOT invent page numbers, book names, or random numbers. ONLY mention books/pages if they are explicitly mentioned in the Explanation text above. Keep it brief and direct. NO fluff. NO tables.`;
 
       const response = await generateContentWithRetry('chat', {
-        model: "gemini-1.5-flash",
+        model: "gemini-2.5-flash",
         contents: [
             { role: "user", parts: [{ text: systemInstruction }] }
         ],
@@ -280,7 +292,7 @@ Return the output as a structured JSON array of strings. Do not return markdown,
       }
 
       const response = await generateContentWithRetry('extract', {
-        model: "gemini-1.5-flash",
+        model: "gemini-2.5-flash",
         contents: [
             { role: "user", parts }
         ],

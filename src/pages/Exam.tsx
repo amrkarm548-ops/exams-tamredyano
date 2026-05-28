@@ -7,6 +7,7 @@ import ReactMarkdown from 'react-markdown';
 import { db, handleFirestoreError, OperationType } from '@/src/lib/firebase';
 import { doc, getDoc, setDoc, addDoc, increment, collection, serverTimestamp, getDocs, query, where, orderBy, onSnapshot } from 'firebase/firestore';
 import { useAuth } from '../context/AuthContext';
+import { generateContentWithRetry } from '@/src/lib/gemini';
 
 // Fisher-Yates shuffle
 function shuffle(array: any[]) {
@@ -140,6 +141,7 @@ export default function Exam() {
   useEffect(() => {
     let unsubUser = () => {};
     let unsubGlobal = () => {};
+    let unsubStrikes = () => {};
     // Check Auth
     if (!studentData) {
       if (!window.location.search.includes('public')) {
@@ -152,30 +154,12 @@ export default function Exam() {
       // PERSISTENT ACCESS CHECK: Ensure student account is still in allowed_students collection and verify device binding
       const isBypassed = studentData.id.startsWith('dummy_');
       
-      // Realtime listener on global_settings for Force Kick (Applies to EVERYONE)
-      unsubGlobal = onSnapshot(doc(db, 'admin_system', 'global_settings'), (docSnap: any) => {
-          if (docSnap.exists()) {
-              const data = docSnap.data();
-              const kickTimestamp = data.force_logout_timestamp;
-              const studentLoginTime = localStorage.getItem('tamrediano_login_time');
-              // If kick was triggered after the student logged in, kick them.
-              if (kickTimestamp && studentLoginTime && kickTimestamp > Number(studentLoginTime)) {
-                  logout();
-                  navigate('/login', { replace: true });
-                  alert("تم طرد جميع الطلاب من قبل الإدارة لتحديث النظام. الرجاء تسجيل الدخول مجدداً قريباً.");
-              }
-          }
-      });
+      // Realtime listener on global_settings alert (Handled in App.tsx now)
 
       if (!isBypassed && !studentData.id.startsWith('student_')) {
           try {
-             // 1. One time check on allowed_students and strikes
+             // 1. One time check on allowed_students
              const verifyAccess = async () => {
-                 const strikeSnap = await getDoc(doc(db, 'strikes', studentData.id));
-                 if (strikeSnap.exists() && strikeSnap.data().banned) {
-                    setIsBannedState(true);
-                    return;
-                 }
                  const allowedSnap = await getDoc(doc(db, 'allowed_students', studentData.id));
                  if (allowedSnap.exists()) {
                     const data = allowedSnap.data();
@@ -197,6 +181,15 @@ export default function Exam() {
              };
              verifyAccess();
 
+             // 1.5 Realtime listener on Strikes for Instant Ban
+             unsubStrikes = onSnapshot(doc(db, 'strikes', studentData.id), (docSnap: any) => {
+                 if (docSnap.exists() && docSnap.data().banned) {
+                     setIsBannedState(true);
+                 } else {
+                     setIsBannedState(false);
+                 }
+             });
+
              // 2. Realtime listener on Users collection for device override
              unsubUser = onSnapshot(doc(db, 'users', studentData.id), (docSnap: any) => {
                  if (docSnap.exists()) {
@@ -217,76 +210,86 @@ export default function Exam() {
       }
     }
 
-    const loadBanksAndState = async () => {
-      // Fallback timer just in case Firestore getDocs hangs
-      const fallbackTimer = setTimeout(() => setLoadingBanks(false), 5000);
-      let fetchedBanks: any[] = [];
-      try {
-        const banksSnap = await getDocs(collection(db, 'banks'));
-        const now = Date.now();
-        fetchedBanks = banksSnap.docs
-            .map(d => ({ id: d.id, ...d.data() }))
-            .filter((b: any) => !b.autoDeleteAt || b.autoDeleteAt > now);
-        setBanks(fetchedBanks);
-      } catch (err) {
-        handleFirestoreError(err, OperationType.GET, 'banks');
-      } finally {
-        clearTimeout(fallbackTimer);
-        setLoadingBanks(false);
-      }
+    let unsubBanks = () => {};
+    let initialLoad = true;
+    
+    // Fallback timer just in case Firestore hangs
+    const fallbackTimer = setTimeout(() => setLoadingBanks(false), 5000);
 
-      const savedState = localStorage.getItem('tamrediano_exam_state');
-      const urlParams = new URLSearchParams(window.location.search);
-      const bankIdUrl = urlParams.get('bank');
+    unsubBanks = onSnapshot(collection(db, 'banks'), (banksSnap) => {
+      const now = Date.now();
+      const fetchedBanks = banksSnap.docs
+          .map(d => ({ id: d.id, ...d.data() }))
+          .filter((b: any) => (!b.autoDeleteAt || b.autoDeleteAt > now) && b.isPublished !== false);
+      
+      setBanks(fetchedBanks);
+      clearTimeout(fallbackTimer);
+      setLoadingBanks(false);
 
-      if (savedState) {
-          const parsed = JSON.parse(savedState);
-          // Check if restored bank still exists!
-          const bankExists = fetchedBanks.find(b => b.id === parsed.bankId);
-          let isAllowed = false;
-          if (bankExists) {
-              if (bankExists.isPublic !== false) {
-                  isAllowed = true;
-              } else if (bankExists.allowedNames) {
-                  const normalize = (n: string) => n.trim().replace(/\s+/g, ' ');
-                  const authName = normalize(studentData?.fullName || studentData?.name || '');
-                  const names = bankExists.allowedNames.split('\n').map(normalize).filter((n: string) => n);
-                  isAllowed = names.includes(authName);
+      if (initialLoad) {
+          initialLoad = false;
+          const savedState = localStorage.getItem('tamrediano_exam_state');
+          const urlParams = new URLSearchParams(window.location.search);
+          const bankIdUrl = urlParams.get('bank');
+
+          if (savedState) {
+              const parsed = JSON.parse(savedState);
+              // Check if restored bank still exists!
+              const bankExists = fetchedBanks.find(b => b.id === parsed.bankId) as any;
+              let isAllowed = false;
+              if (bankExists) {
+                  if (bankExists.isPublic !== false) {
+                      isAllowed = true;
+                  } else if (bankExists.allowedNames) {
+                      const normalize = (n: string) => n.trim().replace(/\s+/g, ' ');
+                      const authName = normalize(studentData?.fullName || studentData?.name || '');
+                      const names = bankExists.allowedNames.split('\n').map(normalize).filter((n: string) => n);
+                      isAllowed = names.includes(authName);
+                  }
               }
-          }
 
-          // If URL bank exists and is different from saved state bank, ignore saved state
-          if (bankIdUrl && bankIdUrl !== parsed.bankId && fetchedBanks.find(b => b.id === bankIdUrl)) {
-              localStorage.removeItem('tamrediano_exam_state');
-              setShowModeSelect(bankIdUrl);
-          } 
-          else if (isAllowed && bankExists && parsed.bankId && parsed.questions && parsed.questions.length > 0) {
-              setSelectedBankId(parsed.bankId);
-              setQuestions(parsed.questions);
-              setSelectedAnswers(parsed.selectedAnswers || {});
-              setBookmarked(parsed.bookmarked || {});
-              setCurrentIndex(parsed.currentIndex || 0);
-              setTimeRemaining(parsed.timeRemaining ?? null);
-              if (parsed.examMode) setExamMode(parsed.examMode);
+              // If URL bank exists and is different from saved state bank, ignore saved state
+              if (bankIdUrl && bankIdUrl !== parsed.bankId && fetchedBanks.find(b => b.id === bankIdUrl)) {
+                  localStorage.removeItem('tamrediano_exam_state');
+                  setShowModeSelect(bankIdUrl);
+              } 
+              else if (isAllowed && bankExists && parsed.bankId && parsed.questions && parsed.questions.length > 0) {
+                  if (parsed.isFinished && !bankIdUrl) {
+                      localStorage.removeItem('tamrediano_exam_state');
+                  } else {
+                      setSelectedBankId(parsed.bankId);
+                      setQuestions(parsed.questions);
+                      setSelectedAnswers(parsed.selectedAnswers || {});
+                      setBookmarked(parsed.bookmarked || {});
+                      setCurrentIndex(parsed.currentIndex || 0);
+                      setTimeRemaining(parsed.timeRemaining ?? null);
+                      if (parsed.examMode) setExamMode(parsed.examMode);
+                      if (parsed.isFinished) setIsFinished(parsed.isFinished);
+                  }
+              } else {
+                  // Clear invalid state
+                  localStorage.removeItem('tamrediano_exam_state');
+                  if (bankIdUrl && fetchedBanks.find(b => b.id === bankIdUrl)) {
+                      setShowModeSelect(bankIdUrl);
+                  }
+              }
           } else {
-              // Clear invalid state
-              localStorage.removeItem('tamrediano_exam_state');
               if (bankIdUrl && fetchedBanks.find(b => b.id === bankIdUrl)) {
                   setShowModeSelect(bankIdUrl);
               }
           }
-      } else {
-          if (bankIdUrl && fetchedBanks.find(b => b.id === bankIdUrl)) {
-              setShowModeSelect(bankIdUrl);
-          }
       }
-    };
-
-    loadBanksAndState();
+    }, (error) => {
+      handleFirestoreError(error, OperationType.GET, 'banks');
+      clearTimeout(fallbackTimer);
+      setLoadingBanks(false);
+    });
 
     return () => {
         unsubUser();
         unsubGlobal();
+        unsubStrikes();
+        unsubBanks();
     };
   }, [navigate]);
 
@@ -299,10 +302,11 @@ export default function Exam() {
         bookmarked,
         currentIndex,
         examMode,
-        timeRemaining
+        timeRemaining,
+        isFinished
       }));
     }
-  }, [questions, selectedAnswers, bookmarked, currentIndex, selectedBankId, examMode, timeRemaining]);
+  }, [questions, selectedAnswers, bookmarked, currentIndex, selectedBankId, examMode, timeRemaining, isFinished]);
   
   useEffect(() => {
     if (supportChatEndRef.current) {
@@ -491,48 +495,88 @@ export default function Exam() {
     try {
       let contextQs: any[] = [];
       if (isFinished) {
-          contextQs = questions.map((q, i) => ({
-             index: i + 1,
-             questionText: q.text,
-             choices: q.options,
-             correctAnswer: q.options[q.correct],
-             studentSelectedAnswer: selectedAnswers[q.id] !== undefined ? q.options[selectedAnswers[q.id]] : "لم يُجب"
-          }));
+          contextQs = questions.map((q, i) => {
+             const userVisibleChoices = (q.choices || q.options.map((opt: string, idx: number) => ({ text: opt, originalIndex: idx })))
+                .map((c: any, index: number) => `${String.fromCharCode(65 + index)}: ${c.text}`);
+             return {
+                 index: i + 1,
+                 questionText: q.text,
+                 choices: userVisibleChoices,
+                 correctAnswer: q.options[q.correct],
+                 studentSelectedAnswer: selectedAnswers[q.id] !== undefined ? q.options[selectedAnswers[q.id]] : "لم يُجب"
+             };
+          });
       } else {
           const q = questions[currentIndex];
           const studentSelected = selectedAnswers[q.id] !== undefined ? q.options[selectedAnswers[q.id]] : "لم يختر الطالب إجابة بعد";
+          const userVisibleChoices = (q.choices || q.options.map((opt: string, idx: number) => ({ text: opt, originalIndex: idx })))
+             .map((c: any, index: number) => `${String.fromCharCode(65 + index)}: ${c.text}`);
           contextQs = [{ 
             index: currentIndex + 1,
             questionText: q.text, 
-            choices: q.options,
+            choices: userVisibleChoices,
             correctAnswer: q.options[q.correct],
             studentSelectedAnswer: studentSelected
           }];
       }
         
-      const bodyPayload: any = {
-        message: userMessage || 'Please refer to the attached document.',
-        history: chatMessages,
-        contextQuestions: contextQs,
-        bankId: selectedBankId
-      };
-      
-      if (currentAttachment) {
-          bodyPayload.fileData = currentAttachment.base64;
-          bodyPayload.mimeType = currentAttachment.mimeType;
+      let referenceBook = "";
+      if (selectedBankId) {
+        try {
+          const bankDoc = await getDoc(doc(db, "banks", selectedBankId));
+          if (bankDoc.exists()) {
+             referenceBook = bankDoc.data().referenceBook || "";
+          }
+        } catch (e) {
+          console.error("Failed to fetch bank's reference book:", e);
+        }
       }
 
-      const res = await fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(bodyPayload)
-      });
-      const data = await res.json();
-      if (!res.ok) {
-         setChatMessages(prev => [...prev, { role: 'model', content: data.error || 'عذراً، حدث خطأ في الاتصال بالذكاء الاصطناعي.' }]);
-      } else {
-         setChatMessages(prev => [...prev, { role: 'model', content: data.message }]);
+      let systemInstruction = `You are a concise, accurate AI medical tutor for Tamrediano. 
+Speak strictly in friendly Egyptian Arabic mixed with simple medical terminology in English. Your language must be VERY SIMPLE, clear, and easy to understand for nursing students. 
+Avoid complex medical jargon where possible, and explain things using everyday analogies. Keep it EXTREMELY SHORT, DIRECT, and SUMMARIZED (ما قل ودل). DO NOT talk too much. Get straight to the point.
+
+CRITICAL RULES FOR MULTIPLE CHOICE QUESTIONS (MCQs):
+1. The student's screen shows choices (A, B, C, D) in a SHUFFLED order, NOT the original book order.
+2. The exact shuffled choices the student sees are provided below under "Choices". 
+3. If the student asks "Why is the first option wrong?" or "Why is choice A wrong?", you MUST look at EXACTLY what is mapped to "A:" or the first item in the "Choices" list below. DO NOT talk about the original choice A from the book. Strictly correlate their letter/position to the literal text provided below.
+
+Never invent facts, numbers, or books. ONLY cite a book/page if it is explicitly provided in the question's explanation or reference text. Always mention the correct page number if it exists in the source text. If you don't know, say you don't know.`;
+
+      if (referenceBook) {
+        systemInstruction += `\n\nCRITICAL CONTEXT / SUBJECT BOOK REFERENCE (Please answer the student's question strictly according to this subject matter and medical information):\n${referenceBook}\n`;
       }
+
+      if (contextQs && contextQs.length > 0) {
+        systemInstruction += `\nHere are the questions the student is asking about:\n`;
+        contextQs.forEach((q: any, i: number) => {
+          systemInstruction += `${q.index ? q.index : i + 1}. Q: ${q.questionText}\nChoices: ${q.choices ? q.choices.join(', ') : 'N/A'}\nCorrect Answer: ${q.correctAnswer}\nStudent's Selected Answer: ${q.studentSelectedAnswer || 'None'}\n`;
+        });
+      }
+
+      const formattedHistory = [
+        { role: "user", parts: [{ text: systemInstruction }] },
+        { role: "model", parts: [{ text: "أهلاً بيك يا دكتور! أنا هنا عشان أساعدك وأشرحلك أي سؤال. اتفضل!" }] },
+        ...(chatMessages || []).map((msg: any) => ({
+          role: msg.role === "user" ? "user" : "model",
+          parts: [{ text: msg.content }]
+        }))
+      ];
+      
+      const userParts: any[] = [{ text: userMessage || 'Please refer to the attached document.' }];
+      if (currentAttachment) {
+          userParts.push({ inlineData: { data: currentAttachment.base64.split(',')[1] || currentAttachment.base64, mimeType: currentAttachment.mimeType } });
+      }
+
+      const response = await generateContentWithRetry('chat', {
+        model: "gemini-2.5-flash",
+        contents: [
+            ...formattedHistory,
+            { role: "user", parts: userParts }
+        ]
+      });
+
+      setChatMessages(prev => [...prev, { role: 'model', content: response.text }]);
     } catch (err) {
       setChatMessages(prev => [...prev, { role: 'model', content: 'عذراً، حدث خطأ في الاتصال بالذكاء الاصطناعي.' }]);
     }
@@ -599,17 +643,35 @@ export default function Exam() {
 
       setGeneratingGuide(true);
       try {
-          const res = await fetch('/api/study-guide', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ incorrectQuestions: incorrectQs })
-          });
-          const data = await res.json();
-          if (!res.ok) {
-             alert(data.error || 'فشل توليد خطة المذاكرة.');
-          } else {
-             setStudyGuide(data.guide);
+          let referenceBook = "";
+          if (selectedBankId) {
+            try {
+              const bankDoc = await getDoc(doc(db, "banks", selectedBankId));
+              if (bankDoc.exists()) {
+                 referenceBook = bankDoc.data().referenceBook || "";
+              }
+            } catch (e) {
+              console.error("Failed to fetch bank's reference book:", e);
+            }
           }
+
+          let systemInstruction = `You are a concise Egyptian Arabic AI tutor.
+The student got these questions wrong:
+${incorrectQs.map((q: any, i: number) => `Q: ${q.text}\nCorrect: ${q.correctAnswer}\nExplanation: ${q.explanation}`).join('\n\n')}
+
+Provide a VERY CONCISE, bulleted summary of WHAT concepts they need to study based ONLY on these explanations. 
+Speak strictly in friendly Egyptian Arabic mixed with simple medical terms in English. Keep it brief and direct. NO fluff. NO tables.
+CRITICAL: DO NOT invent page numbers, book names, or random numbers. ONLY mention books/pages if they are explicitly mentioned in the Explanation text above. Always extract and provide the correct page numbers if they exist in the explanation.`;
+
+          if (referenceBook) {
+              systemInstruction += `\n\nThe questions belong to this reference source: "${referenceBook}". You may use this to clarify the source, but rely on explanations for page numbers.`;
+          }
+
+          const response = await generateContentWithRetry('chat', {
+              model: "gemini-2.5-flash",
+              contents: [{ role: "user", parts: [{ text: systemInstruction }] }]
+          });
+          setStudyGuide(response.text);
       } catch (e) {
           console.error(e);
           alert('فشل توليد التلخيص.');
@@ -1089,6 +1151,13 @@ export default function Exam() {
               <span className="px-3 py-1 rounded-full bg-gray-50 text-gray-600 border border-gray-200 text-[10px] font-bold uppercase tracking-widest shadow-sm">السؤال {String(currentIndex + 1).padStart(2, '0')}</span>
               <div className="flex gap-2">
                   <button 
+                    onClick={() => setShowSupportChat(true)}
+                    className="flex items-center gap-2 text-xs font-bold px-3 py-1 rounded-lg border text-blue-600 hover:text-blue-800 bg-white border-blue-200 hover:bg-blue-50 transition-all shadow-sm"
+                  >
+                    <Headset size={14} />
+                    <span>محادثة الليدر</span>
+                  </button>
+                  <button 
                     onClick={() => setShowReportModal(true)}
                     className="flex items-center gap-2 text-xs font-bold px-3 py-1 rounded-lg border text-red-500 hover:text-red-700 bg-white border-red-200 hover:bg-red-50 transition-all shadow-sm"
                   >
@@ -1471,19 +1540,6 @@ export default function Exam() {
                 </div>
              </div>
           </div>
-      )}
-
-      {/* Support Chat Floating Button */}
-      {!showSupportChat && (
-          <button 
-             onClick={() => setShowSupportChat(true)}
-             className="fixed bottom-24 left-4 sm:bottom-6 sm:left-6 lg:bottom-6 lg:left-6 bg-white text-[#D4AF37] border-2 border-[#D4AF37] rounded-full sm:rounded-2xl flex items-center justify-center shadow-[0_8px_30px_rgb(0,0,0,0.12)] hover:bg-[#D4AF37] hover:text-white transition-all hover:scale-105 z-50 group px-4 py-3 sm:px-5 sm:py-3 gap-2"
-             title="تواصل مع الإدارة"
-          >
-             <Headset size={22} className="animate-pulse" />
-             <span className="font-bold text-sm hidden sm:inline-block whitespace-nowrap">كلم الليدر</span>
-             <span className="block sm:hidden font-bold text-xs whitespace-nowrap">ليدر</span>
-          </button>
       )}
 
       {/* Support Chat Window */}

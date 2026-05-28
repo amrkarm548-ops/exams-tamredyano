@@ -1,6 +1,7 @@
 import { GoogleGenAI } from '@google/genai';
 import { db } from './firebase';
 import { doc, getDoc, setDoc } from 'firebase/firestore';
+import { DEFAULT_EXTRACT_KEYS, DEFAULT_CHAT_KEYS } from './defaultKeys';
 
 // Feature can be 'extract' or 'chat'
 export const getSafeGenAI = async (feature: 'extract' | 'chat') => {
@@ -16,11 +17,14 @@ export const getSafeGenAI = async (feature: 'extract' | 'chat') => {
             currentIndex = data.currentIndex || 0;
         }
 
+        // Merge with env keys and default hardcoded keys dynamically
+        const geminiViteKey = import.meta.env?.VITE_GEMINI_API_KEY;
+        const envKeys = geminiViteKey ? [geminiViteKey] : [];
+            
+        const defaultKeys = feature === 'extract' ? DEFAULT_EXTRACT_KEYS : DEFAULT_CHAT_KEYS;
+        keys = [...new Set([...keys, ...envKeys, ...defaultKeys])];
+
         if (keys.length === 0) {
-           // Fallback to env variable if no keys in DB
-           if (process.env.GEMINI_API_KEY) {
-               return { ai: new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY }), keyUsed: 'env' };
-           }
            throw new Error('No API keys configured');
         }
 
@@ -36,40 +40,50 @@ export const getSafeGenAI = async (feature: 'extract' | 'chat') => {
             feature
         };
     } catch(e) {
-        if (process.env.GEMINI_API_KEY) {
-            return { ai: new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY }), keyUsed: 'env' };
+        const geminiViteKey = import.meta.env?.VITE_GEMINI_API_KEY;
+        const envKeys = geminiViteKey ? [geminiViteKey] : [];
+            
+        const defaultKeys = feature === 'extract' ? DEFAULT_EXTRACT_KEYS : DEFAULT_CHAT_KEYS;
+        const fallbackKeys = [...new Set([...envKeys, ...defaultKeys])];
+            
+        if (fallbackKeys.length > 0) {
+            return { ai: new GoogleGenAI({ apiKey: fallbackKeys[0] }), keyUsed: fallbackKeys[0] };
         }
         throw e;
     }
 };
 
 export const generateContentWithRetry = async (feature: 'extract' | 'chat', request: any, maxRetries = 3, initialDelayMs = 1000) => {
-    // If we're in the browser, route the request through our backend proxy
-    // to bypass CORS and SDK browser restrictions.
-    if (typeof window !== 'undefined') {
-        const res = await fetch('/api/proxy-gemini', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ feature, request, maxRetries, initialDelayMs })
-        });
-        const data = await res.json();
-        
-        if (!res.ok) {
-            const err = new Error(data.error || 'Server error');
-            (err as any).status = res.status;
-            (err as any).usedConfig = data.usedConfig;
-            throw err;
-        }
-        return { text: data.text }; // Return a mock GenerateContentResponse
-    }
-
-    // Server-side execution
     let delay = initialDelayMs;
     let currentAIEnv = await getSafeGenAI(feature);
 
     for (let i = 0; i < maxRetries; i++) {
         try {
-            return await currentAIEnv.ai.models.generateContent(request);
+            // Use REST API to bypass any SDK limitations in the browser
+            const model = request.model || 'gemini-2.5-flash';
+            const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${currentAIEnv.keyUsed}`;
+            
+            const res = await fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    contents: request.contents,
+                    systemInstruction: request.systemInstruction,
+                    generationConfig: request.config || request.generationConfig,
+                })
+            });
+
+            const data = await res.json();
+
+            if (!res.ok) {
+                const err = new Error(data.error?.message || 'Gemini API Error');
+                (err as any).status = data.error?.code || res.status;
+                throw err;
+            }
+
+            const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+            return { text };
+            
         } catch (error: any) {
             const is503 = error?.status === "UNAVAILABLE" || error?.status === 503 || error?.message?.includes("503");
             const is429 = error?.status === "RESOURCE_EXHAUSTED" || error?.status === 429 || error?.message?.includes("429");

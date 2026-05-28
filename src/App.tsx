@@ -17,6 +17,7 @@ import { Toaster, toast } from 'react-hot-toast';
 function AppWrapper({ children }: { children: React.ReactNode }) {
   const [maintenanceMode, setMaintenanceMode] = useState(false);
   const [banned, setBanned] = useState(false);
+  const [kickedOut, setKickedOut] = useState(false);
   const [globalAlert, setGlobalAlert] = useState('');
   const navigate = useNavigate();
 
@@ -24,8 +25,23 @@ function AppWrapper({ children }: { children: React.ReactNode }) {
     if (isFirebasePlaceholder) return;
     
     const unsubGlobal = onSnapshot(doc(db, 'admin_system', 'global_settings'), (snap) => {
-        if (snap.exists() && snap.data().global_alert_message) {
-            setGlobalAlert(snap.data().global_alert_message);
+        if (snap.exists()) {
+            const data = snap.data();
+            if (data.global_alert_message) {
+                setGlobalAlert(data.global_alert_message);
+            } else {
+                setGlobalAlert('');
+            }
+
+            // Realtime kick for students
+            const isAdmin = window.location.pathname.includes('/admin');
+            const studentLoginTime = localStorage.getItem('tamrediano_login_time');
+            if (!isAdmin && data.force_logout_timestamp && studentLoginTime && data.force_logout_timestamp > Number(studentLoginTime)) {
+                localStorage.removeItem('tamrediano_student');
+                localStorage.removeItem('tamrediano_exam_state');
+                localStorage.removeItem('tamrediano_login_time');
+                setKickedOut(true);
+            }
         } else {
             setGlobalAlert('');
         }
@@ -65,6 +81,48 @@ function AppWrapper({ children }: { children: React.ReactNode }) {
     };
   }, []);
 
+  useEffect(() => {
+    // Anti-copy and Anti-screenshot measures for students
+    const isAdmin = window.location.pathname.includes('/admin');
+    if (!isAdmin) {
+      document.body.style.userSelect = 'none';
+      document.body.style.webkitUserSelect = 'none';
+      
+      const handleContextMenu = (e: MouseEvent) => e.preventDefault();
+      const handleKeyDown = (e: KeyboardEvent) => {
+          if (e.key === 'PrintScreen') {
+              navigator.clipboard?.writeText('');
+              document.body.style.display = 'none';
+              setTimeout(() => { document.body.style.display = ''; }, 500);
+          }
+          if ((e.ctrlKey || e.metaKey) && ['c', 'C', 'p', 'P', 's', 'S'].includes(e.key)) {
+              e.preventDefault();
+          }
+      };
+      
+      document.addEventListener('contextmenu', handleContextMenu);
+      document.addEventListener('keydown', handleKeyDown);
+      
+      // Attempt to obscure screen on visibility change (when taking screenshots via snipping tool sometimes triggers this)
+      const handleVisibilityChange = () => {
+          if (document.hidden) {
+             document.body.style.opacity = '0';
+          } else {
+             document.body.style.opacity = '1';
+          }
+      };
+      document.addEventListener('visibilitychange', handleVisibilityChange);
+
+      return () => {
+          document.body.style.userSelect = '';
+          document.body.style.webkitUserSelect = '';
+          document.removeEventListener('contextmenu', handleContextMenu);
+          document.removeEventListener('keydown', handleKeyDown);
+          document.removeEventListener('visibilitychange', handleVisibilityChange);
+      };
+    }
+  }, []);
+
   if (maintenanceMode) {
     return (
       <div className="min-h-screen bg-[#F8F9FA] text-[#1A1A1A] flex flex-col items-center justify-center p-6 text-center font-sans">
@@ -90,6 +148,27 @@ function AppWrapper({ children }: { children: React.ReactNode }) {
            </svg>
            <h2 className="text-xl font-bold mb-2 text-red-600">تم حظر الحساب</h2>
            <p className="text-gray-500 text-sm leading-relaxed">لقد تم حظر حسابك وجهازك بشكل نهائي من النظام بسبب مخالفة السلوك أو استخدام ألفاظ نابية متكررة.</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (kickedOut) {
+    return (
+      <div className="min-h-screen bg-[#F8F9FA] text-[#1A1A1A] flex flex-col items-center justify-center p-6 text-center font-sans">
+        <h1 className="text-4xl font-serif italic text-orange-600 tracking-wider mb-4" style={{ fontFamily: '"Aref Ruqaa", serif' }}>تمريضيانو</h1>
+        <div className="bg-white p-8 rounded-3xl border border-orange-200 max-w-md w-full shadow-[0_10px_40px_-10px_rgba(0,0,0,0.1)]">
+           <svg className="w-16 h-16 text-orange-600 mx-auto mb-4 animate-bounce" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+           </svg>
+           <h2 className="text-xl font-bold mb-2 text-orange-600">طلب النظام التحديث الإجباري 🚀</h2>
+           <p className="text-gray-500 text-sm leading-relaxed mb-6">تم طرد جميع الطلاب بشكل مؤقت من قبل الإدارة لتحديث نظام البنوك وإضافة أسئلة جديدة. يمكنك تسجيل الدخول مرة أخرى الآن!</p>
+           <button 
+             onClick={() => { setKickedOut(false); navigate('/login', { replace: true }); }} 
+             className="w-full bg-orange-600 hover:bg-orange-700 text-white rounded-xl py-3 font-bold shadow-md transition-all active:scale-95"
+           >
+             تسجيل الدخول مجدداً
+           </button>
         </div>
       </div>
     );
