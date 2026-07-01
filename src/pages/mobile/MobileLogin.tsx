@@ -5,7 +5,7 @@ import fuzzysort from 'fuzzysort';
 import { MessageCircle, Send, X, Headset } from 'lucide-react';
 import { db, handleFirestoreError, OperationType } from '@/src/lib/firebase';
 import { collection, getDocs, getDoc, setDoc, doc, Timestamp, addDoc, query, where, orderBy, onSnapshot, serverTimestamp } from 'firebase/firestore';
-import { useAuth } from '../context/AuthContext';
+import { useAuth } from '../../context/AuthContext';
 import { generateContentWithRetry } from '@/src/lib/gemini';
 import toast from 'react-hot-toast';
 
@@ -23,7 +23,7 @@ function FloatingBackground() {
   );
 }
 
-export default function Login() {
+export default function MobileLogin() {
   const navigate = useNavigate();
   const { loginAdmin, loginStudent, studentData } = useAuth();
   const [name, setName] = useState('');
@@ -821,7 +821,9 @@ export default function Login() {
         className="w-full max-w-md bg-white/95 backdrop-blur-xl rounded-3xl shadow-[0_20px_60px_-15px_rgba(0,0,0,0.1)] p-8 border border-white/50 z-10 relative"
       >
         <div className="text-center mb-8">
-          <h1 className="text-5xl font-serif italic text-[#D4AF37] tracking-wider mb-2 select-none drop-shadow-sm" style={{ fontFamily: '"Aref Ruqaa", serif' }}>تمريضيانو</h1>
+          <h1 className="text-5xl font-serif italic text-[#D4AF37] tracking-wider mb-2 select-none drop-shadow-sm flex items-center justify-center gap-2" style={{ fontFamily: '"Aref Ruqaa", serif' }}>
+            <span>تمريضيانو</span>
+          </h1>
           <p className="text-xs uppercase tracking-[0.2em] text-gray-400 font-bold">بوابة الدخول الموحدة</p>
         </div>
 

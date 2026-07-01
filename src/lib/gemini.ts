@@ -3,23 +3,30 @@ import { db } from './firebase';
 import { doc, getDoc, setDoc } from 'firebase/firestore';
 import { DEFAULT_EXTRACT_KEYS, DEFAULT_CHAT_KEYS } from './defaultKeys';
 
+const keyLastUsedTime = new Map<string, number>();
+const featureCurrentIndex = new Map<string, number>();
+
 // Feature can be 'extract' or 'chat'
 export const getSafeGenAI = async (feature: 'extract' | 'chat') => {
     try {
         const docRef = doc(db, 'api_keys', feature);
         const snap = await getDoc(docRef);
         let keys: string[] = [];
-        let currentIndex = 0;
 
         if (snap.exists()) {
             const data = snap.data();
             keys = data.keys || [];
-            currentIndex = data.currentIndex || 0;
         }
 
         // Merge with env keys and default hardcoded keys dynamically
-        const geminiViteKey = import.meta.env?.VITE_GEMINI_API_KEY;
-        const envKeys = geminiViteKey ? [geminiViteKey] : [];
+        const envKeys: string[] = [];
+        const baseKey = (import.meta as any).env?.VITE_GEMINI_API_KEY;
+        if (baseKey) envKeys.push(baseKey);
+        
+        for (let i = 1; i <= 20; i++) {
+            const keyUrl = (import.meta as any).env?.[`VITE_GEMINI_API_KEY_${i}`];
+            if (keyUrl) envKeys.push(keyUrl);
+        }
             
         const defaultKeys = feature === 'extract' ? DEFAULT_EXTRACT_KEYS : DEFAULT_CHAT_KEYS;
         keys = [...new Set([...keys, ...envKeys, ...defaultKeys])];
@@ -28,55 +35,110 @@ export const getSafeGenAI = async (feature: 'extract' | 'chat') => {
            throw new Error('No API keys configured');
         }
 
-        const nextIndex = (currentIndex + 1) % keys.length;
-        // Fire and forget update to rotate for the next request
-        setDoc(docRef, { currentIndex: nextIndex }, { merge: true }).catch(console.error);
+        // Enforce a tiny 200ms cooldown to just space out very bursty parallel calls on a single key
+        const now = Date.now();
+        let validKeys = keys.filter(k => (now - (keyLastUsedTime.get(k) || 0)) > 200);
+
+        if (validKeys.length === 0) {
+            // Find the key that will be available first
+            let oldestUsed = Number.MAX_SAFE_INTEGER;
+            let bestKey = keys[0];
+            for (const k of keys) {
+                const usedAt = keyLastUsedTime.get(k) || 0;
+                if (usedAt < oldestUsed) {
+                    oldestUsed = usedAt;
+                    bestKey = k;
+                }
+            }
+            
+            // If the key is penalized (usedAt > now + 1000), we don't wait for the full penalty here, 
+            // the retry loop handles backoff. We just pick it.
+            // But if it's just a normal cooldown (< 200ms), we wait.
+            const waitTime = oldestUsed > now ? 0 : 200 - (now - oldestUsed);
+            
+            if (waitTime > 0 && waitTime <= 200) {
+                await new Promise(resolve => setTimeout(resolve, waitTime));
+            }
+            validKeys = [bestKey];
+        }
+
+        // Randomly select one valid key
+        const randomIndex = Math.floor(Math.random() * validKeys.length);
+        const selectedKey = validKeys[randomIndex];
+
+        // Update the use time, BUT ONLY if it's not currently penalized
+        const currentUsedTime = keyLastUsedTime.get(selectedKey) || 0;
+        if (currentUsedTime <= Date.now()) {
+            keyLastUsedTime.set(selectedKey, Date.now());
+        }
 
         return { 
-            ai: new GoogleGenAI({ apiKey: keys[currentIndex] }), 
-            keyUsed: keys[currentIndex],
+            ai: new GoogleGenAI({ apiKey: selectedKey }), 
+            keyUsed: selectedKey,
             allKeys: keys,
-            currentIndex,
             feature
         };
     } catch(e) {
-        const geminiViteKey = import.meta.env?.VITE_GEMINI_API_KEY;
-        const envKeys = geminiViteKey ? [geminiViteKey] : [];
+        const envKeys: string[] = [];
+        const baseKey = (import.meta as any).env?.VITE_GEMINI_API_KEY;
+        if (baseKey) envKeys.push(baseKey);
+        
+        for (let i = 1; i <= 20; i++) {
+            const keyUrl = (import.meta as any).env?.[`VITE_GEMINI_API_KEY_${i}`];
+            if (keyUrl) envKeys.push(keyUrl);
+        }
             
         const defaultKeys = feature === 'extract' ? DEFAULT_EXTRACT_KEYS : DEFAULT_CHAT_KEYS;
         const fallbackKeys = [...new Set([...envKeys, ...defaultKeys])];
             
         if (fallbackKeys.length > 0) {
-            return { ai: new GoogleGenAI({ apiKey: fallbackKeys[0] }), keyUsed: fallbackKeys[0] };
+            const fallbackKey = fallbackKeys[Math.floor(Math.random() * fallbackKeys.length)];
+            keyLastUsedTime.set(fallbackKey, Date.now());
+            return { ai: new GoogleGenAI({ apiKey: fallbackKey }), keyUsed: fallbackKey, feature };
         }
         throw e;
     }
 };
 
-export const generateContentWithRetry = async (feature: 'extract' | 'chat', request: any, maxRetries = 3, initialDelayMs = 1000) => {
+export const generateContentWithRetry = async (feature: 'extract' | 'chat', request: any, maxRetries = 6, initialDelayMs = 1500) => {
     let delay = initialDelayMs;
     let currentAIEnv = await getSafeGenAI(feature);
 
     for (let i = 0; i < maxRetries; i++) {
         try {
             // Use REST API to bypass any SDK limitations in the browser
-            const model = request.model || 'gemini-2.5-flash';
+            let model = request.model || 'gemini-2.5-flash';
+            if (model === 'gemini-1.5-flash-8b') {
+                model = 'gemini-1.5-flash';
+            }
             const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${currentAIEnv.keyUsed}`;
+            
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 35000); // 35 seconds timeout
             
             const res = await fetch(url, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
+                signal: controller.signal,
                 body: JSON.stringify({
                     contents: request.contents,
                     systemInstruction: request.systemInstruction,
                     generationConfig: request.config || request.generationConfig,
+                    safetySettings: [
+                        { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+                        { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+                        { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+                        { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" }
+                    ]
                 })
             });
+            
+            clearTimeout(timeoutId);
 
-            const data = await res.json();
+            const data = await res.json().catch(() => ({}));
 
             if (!res.ok) {
-                const err = new Error(data.error?.message || 'Gemini API Error');
+                const err = new Error(data.error?.message || `HTTP ${res.status}`);
                 (err as any).status = data.error?.code || res.status;
                 throw err;
             }
@@ -86,18 +148,45 @@ export const generateContentWithRetry = async (feature: 'extract' | 'chat', requ
             
         } catch (error: any) {
             const is503 = error?.status === "UNAVAILABLE" || error?.status === 503 || error?.message?.includes("503");
-            const is429 = error?.status === "RESOURCE_EXHAUSTED" || error?.status === 429 || error?.message?.includes("429");
+            const is429 = error?.status === "RESOURCE_EXHAUSTED" || error?.status === 429 || error?.message?.includes("429") || error?.message?.includes("quota");
             const is500 = error?.status === "INTERNAL" || error?.status === 500 || error?.message?.includes("500");
+            const is404 = error?.status === "NOT_FOUND" || error?.status === 404 || error?.message?.includes("404") || error?.message?.includes("not found");
+            const is403 = error?.status === 403 || error?.message?.includes("403") || error?.message?.includes("PERMISSION_DENIED");
+            const is400 = error?.status === 400 || error?.message?.includes("400") || error?.message?.includes("INVALID_ARGUMENT");
             
-            if ((is503 || is429 || is500) && i < maxRetries - 1) {
-                console.warn(`[Gemini API] Error ${error?.status || 'API Error'} using key ${currentAIEnv.keyUsed}, retrying with next key in ${delay}ms... (Attempt ${i + 1} of ${maxRetries})`);
+            // Handle node/browser fetch errors (Timeout, Network error, Abort)
+            const isNetworkError = error.name === 'AbortError' || error instanceof TypeError || error.message?.includes('fetch') || error.message?.includes('network');
+
+            if ((is503 || is429 || is500 || is404 || is403 || is400 || isNetworkError) && i < maxRetries - 1) {
+                // Mask the actual key to prevent exposing it in console
+                const maskedKey = currentAIEnv.keyUsed.substring(0, 8) + '...';
+                console.warn(`[Gemini API] Error ${error?.status || error?.message || 'API Error'} using key ${maskedKey}, retrying with next key in ${delay}ms... (Attempt ${i + 1} of ${maxRetries})`);
+                
+                // Always penalize the key on failure to force rotation, especially for 429 and network issues
+                keyLastUsedTime.set(currentAIEnv.keyUsed, Date.now() + 60000);
+
                 await new Promise(resolve => setTimeout(resolve, delay));
-                delay *= 2; // Exponential backoff
+                delay *= 1.5; // Exponential backoff
+                
+                // Rotate models on 404 or 429 or 403 or 400
+                if (is429 || is404 || is403 || is400) {
+                    if (request.model === 'gemini-2.5-flash') {
+                        request.model = 'gemini-2.0-flash';
+                    } else if (request.model === 'gemini-2.0-flash') {
+                        request.model = 'gemini-1.5-flash';
+                    } else if (request.model === 'gemini-1.5-flash' || request.model === 'gemini-1.5-flash-8b') {
+                        request.model = 'gemini-2.5-flash';
+                    } else {
+                        request.model = 'gemini-2.5-flash'; // Fallback for any other custom string
+                    }
+                }
+
                 currentAIEnv = await getSafeGenAI(feature);
                 continue;
             }
             // Throw error with the last used config so caller can see it
-            error.usedConfig = { keyUsed: currentAIEnv.keyUsed, feature: currentAIEnv.feature };
+            const maskedKeyForError = currentAIEnv.keyUsed.substring(0, 8) + '...';
+            error.usedConfig = { keyUsed: maskedKeyForError, feature: currentAIEnv.feature };
             throw error;
         }
     }

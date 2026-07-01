@@ -82,6 +82,7 @@ export default function AdminDashboard() {
   // States
   const [drafts, setDrafts] = useState<any[]>([]);
   const [banks, setBanks] = useState<any[]>([]);
+  const [downloadingBankId, setDownloadingBankId] = useState<string | null>(null);
   const [reports, setReports] = useState<any[]>([]);
   const [examResults, setExamResults] = useState<any[]>([]);
   const [liveQuestions, setLiveQuestions] = useState<any[]>([]);
@@ -100,6 +101,8 @@ export default function AdminDashboard() {
   const [selectedStudents, setSelectedStudents] = useState<string[]>([]);
   const [selectedLiveQs, setSelectedLiveQs] = useState<string[]>([]);
   const [selectedLiveBankFilter, setSelectedLiveBankFilter] = useState('');
+  const [visibleLiveCount, setVisibleLiveCount] = useState(50);
+  const [visibleDraftsCount, setVisibleDraftsCount] = useState(50);
   const [confirmDialog, setConfirmDialog] = useState<{message: string, onConfirm: () => void} | null>(null);
   const [promptDialog, setPromptDialog] = useState<{message: string, defaultValue: string, onConfirm: (val: string) => void} | null>(null);
   const [selectedBankToConfigure, setSelectedBankToConfigure] = useState<any | null>(null);
@@ -175,15 +178,17 @@ export default function AdminDashboard() {
 
   // Manual Draft State
   const [showManualForm, setShowManualForm] = useState(false);
-  const [manualForm, setManualForm] = useState({ text: '', options: ['', '', '', ''], correct: 0, explanation: '', bankId: '' });
+  const [manualForm, setManualForm] = useState({ type: 'mcq', text: '', options: ['', '', '', ''], correct: 0, explanation: '', bankId: '' });
 
   // Extraction State
   const [extractTextAsIs, setExtractTextAsIs] = useState('');
   const [extractTextSmart, setExtractTextSmart] = useState('');
-  const [extractFileAsIs, setExtractFileAsIs] = useState<{base64: string, mimeType: string} | null>(null);
-  const [extractFileSmart, setExtractFileSmart] = useState<{base64: string, mimeType: string} | null>(null);
+  const [extractFilesAsIs, setExtractFilesAsIs] = useState<{base64: string, mimeType: string, name: string}[]>([]);
+  const [extractFilesSmart, setExtractFilesSmart] = useState<{base64: string, mimeType: string, name: string}[]>([]);
   const [questionDifficulty, setQuestionDifficulty] = useState('medium');
   const [extraInstructions, setExtraInstructions] = useState('');
+  const [extractRatioMode, setExtractRatioMode] = useState('mcq_only');
+  const [extractRatioPercentage, setExtractRatioPercentage] = useState(50);
   const [questionCount, setQuestionCount] = useState(5);
   const [generating, setGenerating] = useState(false);
   const [extractedQuestions, setExtractedQuestions] = useState<any[]>([]);
@@ -264,8 +269,10 @@ export default function AdminDashboard() {
       const feedbacksSnap = await getDocs(collection(db, 'exam_feedback'));
       setFeedbacks(feedbacksSnap.docs.map(d => ({ id: d.id, ...d.data() })));
 
-      const unsubscribeChats = onSnapshot(query(collection(db, 'support_chats'), orderBy('createdAt', 'asc')), (snap) => {
-          setSupportChats(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+      const unsubscribeChats = onSnapshot(query(collection(db, 'support_chats')), (snap) => {
+          const chats = snap.docs.map(d => ({ id: d.id, ...d.data() as any }));
+          chats.sort((a, b) => (a.createdAt?.seconds || 0) - (b.createdAt?.seconds || 0));
+          setSupportChats(chats);
       });
 
       // Fetch API Keys
@@ -281,7 +288,7 @@ export default function AdminDashboard() {
       }
       
       try {
-          const geminiKey = import.meta.env?.VITE_GEMINI_API_KEY || '';
+          const geminiKey = (import.meta as any).env?.VITE_GEMINI_API_KEY || '';
           if (geminiKey) setEnvKey(geminiKey);
           
           if (geminiKey) {
@@ -363,18 +370,22 @@ export default function AdminDashboard() {
     setGenerating(true);
     let usedConfig: any = null;
     try {
-      const systemInstruction = `Extract ALL MCQs from the provided text exactly as they are. DO NOT modify the questions, options, or explanations. You must parse them into a JSON array format.
-CRITICAL RULES:
-1. Return strictly JSON array.
-2. Structure: [{"text": "...", "options": ["A", "B", "C", "D"], "correct": 0, "explanation": "..."}]
-3. If no explanation exists, leave it empty.
-4. "correct" must be an integer index (0-3).`;
+      const systemInstruction = `Extract ALL MCQs and True/False questions from the provided text.
+CRITICAL RULES for AS-IS Extraction:
+1. Return strictly JSON array. Structure: [{"text": "...", "options": ["A", "B", "C", "D"], "correct": 0, "explanation": "..."}]
+2. FIX SPACING ISSUES: The provided text might have merged words (e.g., "Thepatienthasfever"). You MUST add the correct spaces between words while keeping the content essentially as intended. If the content is in Arabic, fix Arabic spacing.
+3. EXTRACT OPTIONS: If the source text does not clearly separate options (e.g., they are merged into the question text), intelligently deduce and extract the options from the text.
+4. "correct" MUST be the exact integer index (0-3) of the correct answer in the "options" array. If no correct answer is indicated, assume 0.
+5. If no explanation exists, leave it empty.
+6. CRITICAL: DO NOT invent, change, or hallucinate numbers from the provided text. Stick STRICTLY to what is copied.`;
 
       const userParts: any[] = [];
-      if (extractFileAsIs) {
+      if (extractFilesAsIs.length > 0) {
          userParts.push({ text: systemInstruction });
-         userParts.push({ inlineData: { data: extractFileAsIs.base64, mimeType: extractFileAsIs.mimeType } });
-         if (extractTextAsIs && !extractTextAsIs.includes("تم إرفاق ملف PDF")) {
+         for (const file of extractFilesAsIs) {
+             userParts.push({ inlineData: { data: file.base64, mimeType: file.mimeType } });
+         }
+         if (extractTextAsIs) {
              userParts.push({ text: "\nAdditional Text:\n" + extractTextAsIs });
          }
       } else {
@@ -408,29 +419,47 @@ CRITICAL RULES:
     setGenerating(true);
     let usedConfig: any = null;
     try {
-      const systemInstruction = `Extract exactly ${questionCount} nursing MCQs from this text.
+      const isFileAttached = extractFilesSmart.length > 0;
+      let ratioText = "Generate ONLY Multiple Choice Questions (MCQs) with 4 options.";
+      if (extractRatioMode === 'tf_only') ratioText = "Generate ONLY True/False questions. Ensure options strictly consist of ['True', 'False'].";
+      else if (extractRatioMode === 'mixed') ratioText = `Generate a mix of questions: approximately ${extractRatioPercentage}% MCQs (4 options) and ${100 - extractRatioPercentage}% True/False (['True', 'False'] options).`;
+      
+      const sourceCitationRule = isFileAttached ? 
+      "The explanation MUST end with a citation of the exact source from the provided PDF/documents." :
+      "Since this is copied text, DO NOT include any source or citation at all in the explanation. Just provide the explanation.";
+
+      const systemInstruction = `Extract exactly ${questionCount} nursing questions from this text.
 Difficulty Level: ${questionDifficulty}.
+Type constraints: ${ratioText}
 Additional User Instructions: ${extraInstructions}
+
 CRITICAL RULES:
-1. Questions and choices (A,B,C,D) MUST be in English.
-2. Explanations should follow user instructions, defaulting to Egyptian Arabic if not specified differently. The explanation MUST include the exact source page number from the provided text or document if available (e.g., 'Source: Page X').
-3. DO NOT make the correct answer longer or shorter than the other options.
-4. DO NOT add brackets or any hints that distinguish the correct answer.
-5. Return the result STRICTLY as a JSON array. Structure:
+1. Questions and choices MUST be in English.
+2. Explanations MUST be in friendly Egyptian Arabic mixed with some simple terms. Also occasionally add a playful joke like "شكل المركز الفني في البنك مش بيرد".
+3. FIX SPACING ISSUES: Ensure no merged text. Intelligently format options if they are merged into text.
+4. ${sourceCitationRule}
+5. CRITICAL: DO NOT invent or hallucinate numbers or facts. If parsing copied text, stick STRICTLY to the numbers provided in the text.
+6. SHUFFLE OPTIONS: Randomize the order of the choices.
+7. "correct" MUST be the exact integer index in the final "options" array.
+8. FAIR OPTIONS RULE: The correct option MUST NOT be significantly longer or shorter than the others.
+9. Return the result STRICTLY as a JSON array without markdown tracking. Structure:
 [
   {
+    "type": "mcq", // or "tf", or "essay"
     "text": "The English question text",
     "options": ["Option A", "Option B", "Option C", "Option D"],
     "correct": 0,
-    "explanation": "شرح التفسير، المصدر: صفحة X"
+    "explanation": "شرح بالمصري..."
   }
 ]`;
 
       const userParts: any[] = [];
-      if (extractFileSmart) {
+      if (extractFilesSmart.length > 0) {
          userParts.push({ text: systemInstruction });
-         userParts.push({ inlineData: { data: extractFileSmart.base64, mimeType: extractFileSmart.mimeType } });
-         if (extractTextSmart && !extractTextSmart.includes("تم إرفاق ملف PDF")) {
+         for (const file of extractFilesSmart) {
+             userParts.push({ inlineData: { data: file.base64, mimeType: file.mimeType } });
+         }
+         if (extractTextSmart) {
              userParts.push({ text: "\nAdditional Text:\n" + extractTextSmart });
          }
       } else {
@@ -509,6 +538,7 @@ CRITICAL RULES:
             try {
               const docRef = await addDoc(collection(db, 'live_banks'), {
                 bankId,
+                type: draft.type || 'mcq',
                 text: draft.text,
                 options: draft.options,
                 correct: draft.correct,
@@ -638,39 +668,50 @@ CRITICAL RULES:
   };
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>, type: 'as-is' | 'smart') => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
 
     const setFn = type === 'as-is' ? setExtractTextAsIs : setExtractTextSmart;
-    const setFileFn = type === 'as-is' ? setExtractFileAsIs : setExtractFileSmart;
+    const setFilesFn = type === 'as-is' ? setExtractFilesAsIs : setExtractFilesSmart;
 
     try {
-      if (file.name.endsWith('.txt') || file.name.endsWith('.md')) {
-        const reader = new FileReader();
-        reader.onload = (evt) => {
-          setFn(evt.target?.result as string);
-        };
-        reader.readAsText(file);
-      } else if (file.name.endsWith('.pdf')) {
-        setFn(`[تم إرفاق ملف PDF: ${file.name}]\nسيتم إرسال الملف كاملاً للاستخراج الذكي بدلاً من قراءة النص فقط لحل مشكلة الجداول والتنسيقات.`);
-        const pdfBase64 = await new Promise<string>((resolve) => {
-            const reader = new FileReader();
-            reader.onload = (evt) => resolve((evt.target?.result as string).split(',')[1]);
-            reader.readAsDataURL(file);
-        });
-        setFileFn({ base64: pdfBase64, mimeType: "application/pdf" });
-      } else if (file.name.endsWith('.docx')) {
-        setFn('جاري قراءة ملف الـ DOCX... يرجى الانتظار.');
-        const arrayBuffer = await file.arrayBuffer();
-        const result = await mammoth.extractRawText({ arrayBuffer });
-        setFn(result.value);
-      } else {
-        alert('صيغة الملف غير مدعومة.');
+      let combinedText = type === 'as-is' ? extractTextAsIs : extractTextSmart;
+      const newFiles: {base64: string, mimeType: string, name: string}[] = [];
+
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        if (file.name.endsWith('.txt') || file.name.endsWith('.md')) {
+          const reader = new FileReader();
+          const text = await new Promise<string>((resolve) => {
+            reader.onload = (evt) => resolve(evt.target?.result as string);
+            reader.readAsText(file);
+          });
+          combinedText += `\n\n--- الملف: ${file.name} ---\n\n` + text;
+        } else if (file.name.endsWith('.pdf')) {
+          combinedText += `\n\n[تم إرفاق ملف PDF: ${file.name}]`;
+          const pdfBase64 = await new Promise<string>((resolve) => {
+              const reader = new FileReader();
+              reader.onload = (evt) => resolve((evt.target?.result as string).split(',')[1]);
+              reader.readAsDataURL(file);
+          });
+          newFiles.push({ base64: pdfBase64, mimeType: "application/pdf", name: file.name });
+        } else if (file.name.endsWith('.docx')) {
+          combinedText += `\n\n--- الملف: ${file.name} --- (جاري القراءة...)`;
+          setFn(combinedText);
+          const arrayBuffer = await file.arrayBuffer();
+          const result = await mammoth.extractRawText({ arrayBuffer });
+          combinedText = combinedText.replace(`--- الملف: ${file.name} --- (جاري القراءة...)`, `\n\n--- الملف: ${file.name} ---\n\n` + result.value);
+        } else {
+          alert(`صيغة الملف غير مدعومة: ${file.name}`);
+        }
       }
+
+      setFn(combinedText);
+      setFilesFn(prev => [...prev, ...newFiles]);
+
     } catch (error) {
       console.error("File parsing error:", error);
-      alert('حدث خطأ أثناء قراءة الملف. يرجى المحاولة باستخدام ملف .txt بدلاً منه.');
-      setFn('');
+      alert('حدث خطأ أثناء قراءة الملفات.');
     }
   };
 
@@ -688,13 +729,51 @@ CRITICAL RULES:
     }});
   };
 
-  const handleUnban = async (userId: string) => {
-    setConfirmDialog({ message: 'هل أنت متأكد من فك الحظر عن هذا الطالب؟', onConfirm: async () => {
+  const handleUnban = async (strikeOrUserId: string) => {
+    setConfirmDialog({ message: 'هل أنت متأكد من فك الحظر عن هذا الحساب / الجهاز؟', onConfirm: async () => {
         try {
-          await setDoc(doc(db, 'users', userId), { ips: [] }, { merge: true });
-          await setDoc(doc(db, 'strikes', userId), { count: 0, banned: false }, { merge: true });
+          const { getDocs, query, collection } = await import('firebase/firestore');
+          
+          // Try to find the associated strike to get the student name
+          let targetName = '';
+          const strikeObj = strikes.find(s => s.id === strikeOrUserId);
+          if (strikeObj && strikeObj.studentName) {
+              targetName = strikeObj.studentName;
+          } else {
+              const u = users.find(u => u.id === strikeOrUserId);
+              if (u && (u.fullName || u.name)) targetName = u.fullName || u.name;
+          }
+
+          // Unban the directly passed ID (could be userId, IP, or deviceId)
+          await setDoc(doc(db, 'users', strikeOrUserId), { ips: [], banned: false, currentDeviceId: '' }, { merge: true });
+          await setDoc(doc(db, 'strikes', strikeOrUserId), { count: 0, banned: false }, { merge: true });
+          await setDoc(doc(db, 'allowed_students', strikeOrUserId), { banned: false }, { merge: true });
+
+          // If we found a name, let's hunt down all strikes associated with this name and unban them too
+          if (targetName) {
+              for (const s of strikes) {
+                  if (s.studentName === targetName && s.banned) {
+                      await setDoc(doc(db, 'strikes', s.id), { count: 0, banned: false }, { merge: true });
+                  }
+              }
+              const userDocs = users.filter(u => u.fullName === targetName || u.name === targetName);
+              for (const u of userDocs) {
+                  await setDoc(doc(db, 'users', u.id), { ips: [], banned: false, currentDeviceId: '' }, { merge: true });
+                  await setDoc(doc(db, 'strikes', u.id), { count: 0, banned: false }, { merge: true });
+                  if (u.ips && Array.isArray(u.ips)) {
+                      for (const ip of u.ips) {
+                         await setDoc(doc(db, 'strikes', ip), { count: 0, banned: false }, { merge: true });
+                      }
+                  }
+                  if (u.currentDeviceId) {
+                     await setDoc(doc(db, 'strikes', u.currentDeviceId), { count: 0, banned: false }, { merge: true });
+                  }
+              }
+          }
+
           fetchData();
           notifyAdmins();
+          toast.success("تم فك الحظر عن الطالب وجميع أجهزته والـ IPs المرتبطة به بنجاح.");
         } catch (e) {
           console.error(e);
           alert('فشل فك الحظر');
@@ -772,6 +851,7 @@ CRITICAL RULES:
             for (const draft of chunk) {
                 const liveRef = doc(collection(db, 'live_banks'));
                 batch.set(liveRef, { 
+                  type: draft.type || 'mcq',
                   text: draft.text, 
                   options: draft.options, 
                   correct: draft.correct, 
@@ -836,6 +916,7 @@ CRITICAL RULES:
                   const liveRef = doc(collection(db, 'live_banks'));
                   batch.set(liveRef, { 
                     bankId: targetBankId,
+                    type: draft.type || 'mcq',
                     text: draft.text,
                     options: draft.options,
                     correct: draft.correct,
@@ -959,6 +1040,7 @@ Output MUST be a JSON array of objects without markdown blocks. Do NOT return \`
                     for (const q of questionsData) {
                         const docRef = await addDoc(collection(db, 'live_banks'), {
                           bankId: bankId,
+                          type: q.type || 'mcq',
                           text: q.text,
                           options: q.options || [],
                           correct: q.correct,
@@ -1192,31 +1274,29 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
   };
 
   const handleCreateManualDraft = async () => {
-      if (!manualForm.text || manualForm.options.some(o => !o) || !manualForm.explanation) {
-          alert('يرجى ملء جميع الحقول!');
+      if (!manualForm.text || !manualForm.explanation) {
+          alert('يرجى ملء نص السؤال والتفسير!');
+          return;
+      }
+      if (manualForm.type !== 'essay' && manualForm.options.some(o => !o)) {
+          alert('يرجى ملء جميع الاختيارات!');
           return;
       }
       try {
-          const docRef = await addDoc(collection(db, 'drafts'), {
+          const newDraft = {
+            type: manualForm.type,
             text: manualForm.text,
-            options: manualForm.options,
-            correct: manualForm.correct,
+            options: manualForm.type === 'essay' ? [] : manualForm.options,
+            correct: manualForm.type === 'essay' ? 0 : manualForm.correct,
             explanation: manualForm.explanation,
             status: 'pending',
             createdAt: serverTimestamp(),
             bankId: manualForm.bankId || ''
-          });
-          setDrafts(prev => [{
-            id: docRef.id,
-            text: manualForm.text,
-            options: manualForm.options,
-            correct: manualForm.correct,
-            explanation: manualForm.explanation,
-            status: 'pending',
-            bankId: manualForm.bankId || ''
-          }, ...prev]);
+          };
+          const docRef = await addDoc(collection(db, 'drafts'), newDraft);
+          setDrafts(prev => [{ id: docRef.id, ...newDraft }, ...prev]);
           setShowManualForm(false);
-          setManualForm({ text: '', options: ['', '', '', ''], correct: 0, explanation: '', bankId: '' });
+          setManualForm({ type: 'mcq', text: '', options: ['', '', '', ''], correct: 0, explanation: '', bankId: '' });
           alert('تم إضافة السؤال يدوياً بنجاح!');
       } catch (e) {
           console.error(e);
@@ -1246,7 +1326,7 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
              
              allDocsToDelete.push(...banks.map(b => ({ col: 'banks', id: b.id })));
              allDocsToDelete.push(...liveQuestions.map(q => ({ col: 'live_banks', id: q.id })));
-             allDocsToDelete.push(...drafts.map(d => ({ col: 'questions', id: d.id })));
+             allDocsToDelete.push(...drafts.map(d => ({ col: 'drafts', id: d.id })));
              
              const chatSnap = await getDocs(collection(db, 'chat_history'));
              allDocsToDelete.push(...chatSnap.docs.map(d => ({ col: 'chat_history', id: d.id })));
@@ -1334,7 +1414,7 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
          <select 
             value={activeTab} 
             onChange={(e) => setActiveTab(e.target.value)}
-            className="bg-white border border-gray-200 text-sm font-bold p-2 text-gray-700 rounded-lg outline-none focus:border-[#D4AF37] shadow-sm max-w-[150px] truncate"
+            className="bg-white border border-gray-200 text-sm font-bold p-2 text-gray-700 rounded-lg outline-none focus:border-[#D4AF37] shadow-sm"
          >
             <option value="overview">نظرة عامة</option>
             <option value="extract">استخراج الأسئلة</option>
@@ -1483,7 +1563,7 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
                              return { name: b.name, 'نسبة النجاح': avgScore, 'عدد الاختبارات': bResults.length };
                           }).filter(b => b['عدد الاختبارات'] > 0)}>
                              <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#E5E7EB" />
-                             <XAxis dataKey="name" axisLine={false} tickLine={false} tick={{fill: '#6B7280', fontSize: 12, fontWeight: 'bold'}} />
+                             <XAxis dataKey="name" axisLine={false} tickLine={false} interval={0} angle={-30} textAnchor="end" height={80} tick={{fill: '#6B7280', fontSize: 10, fontWeight: 'bold'}} />
                              <YAxis width={40} axisLine={false} tickLine={false} tick={{fill: '#6B7280', fontSize: 12}} />
                              <Tooltip cursor={{fill: '#F3F4F6'}} contentStyle={{borderRadius: '12px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)'}} />
                              <Legend />
@@ -1498,16 +1578,22 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
 
               {(() => {
                   const dailyData: Record<string, Set<string>> = {};
-                  [...examResults].sort((a,b) => (a.createdAt?.toMillis() || 0) - (b.createdAt?.toMillis() || 0)).forEach(r => {
+                  [...examResults].sort((a,b) => {
+                      const timeA = a.createdAt?.toMillis ? a.createdAt.toMillis() : (a.createdAt instanceof Date ? a.createdAt.getTime() : 0);
+                      const timeB = b.createdAt?.toMillis ? b.createdAt.toMillis() : (b.createdAt instanceof Date ? b.createdAt.getTime() : 0);
+                      return timeA - timeB;
+                  }).forEach(r => {
                       if (!r.createdAt) return;
-                      const dateStr = r.createdAt.toDate().toLocaleDateString('ar-EG', { month: 'short', day: 'numeric' });
+                      const dateObj = r.createdAt.toDate ? r.createdAt.toDate() : (r.createdAt instanceof Date ? r.createdAt : new Date());
+                      const dateStr = dateObj.toLocaleDateString('ar-EG', { month: 'short', day: 'numeric' });
                       if (!dailyData[dateStr]) dailyData[dateStr] = new Set();
                       dailyData[dateStr].add(r.studentId);
                   });
                   
                   users.forEach(u => {
                       if (!u.lastLogin) return;
-                      const dateStr = u.lastLogin.toDate().toLocaleDateString('ar-EG', { month: 'short', day: 'numeric' });
+                      const dateObj = u.lastLogin.toDate ? u.lastLogin.toDate() : (u.lastLogin instanceof Date ? u.lastLogin : new Date());
+                      const dateStr = dateObj.toLocaleDateString('ar-EG', { month: 'short', day: 'numeric' });
                       if (!dailyData[dateStr]) dailyData[dateStr] = new Set();
                       dailyData[dateStr].add(u.id);
                   });
@@ -1555,7 +1641,7 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
                   <div className="w-full mt-4 space-y-3">
                      <div className="flex flex-col md:flex-row gap-3 items-center w-full">
                          <span className="font-bold text-gray-700 min-w-[200px]">الرابط العام (الرئيسية):</span>
-                         <div className="flex-1 bg-white/80 border border-gray-200 rounded-xl px-3 py-2 font-mono text-xs text-gray-600 truncate text-left" dir="ltr">
+                         <div className="flex-1 w-full bg-white/80 border border-gray-200 rounded-xl px-3 py-2 font-mono text-xs text-gray-600 break-all text-left" dir="ltr">
                            {window.location.origin}
                          </div>
                          <button onClick={() => {
@@ -1573,7 +1659,7 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
                                  {b.name}
                                  {isExpired && <span className="text-red-500 text-[10px] mr-2">(مُخفى تلقائياً)</span>}
                                :</span>
-                               <div className="flex-1 bg-white/80 border border-gray-200 rounded-xl px-3 py-2 font-mono text-xs text-gray-600 truncate text-left" dir="ltr">
+                               <div className="flex-1 w-full bg-white/80 border border-gray-200 rounded-xl px-3 py-2 font-mono text-xs text-gray-600 break-all text-left" dir="ltr">
                                  {bankUrl}
                                </div>
                                <button onClick={() => {
@@ -1624,11 +1710,14 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
                              dir="auto"
                           />
                        </div>
-                       <div className="w-full relative">
-                          <input type="file" accept=".txt,.md,.pdf,.docx" onChange={(e) => handleFileUpload(e, 'as-is')} className="hidden" id="file-upload-as-is" />
-                          <label htmlFor="file-upload-as-is" className="border border-dashed border-gray-300 hover:border-[#D4AF37] bg-white hover:bg-yellow-50 p-4 rounded-xl flex items-center justify-center cursor-pointer transition-colors w-full h-16 gap-2">
-                             <CloudUpload size={24} className="text-gray-400" />
-                             <span className="text-sm font-bold text-gray-600">اختيار ملف (.pdf, .docx, .txt)</span>
+                       <div className="w-full relative flex flex-col gap-2">
+                          <input type="file" multiple accept=".txt,.md,.pdf,.docx" onChange={(e) => handleFileUpload(e, 'as-is')} className="hidden" id="file-upload-as-is" />
+                          <label htmlFor="file-upload-as-is" className="border border-dashed border-gray-300 hover:border-[#D4AF37] bg-white hover:bg-yellow-50 p-4 rounded-xl flex flex-col items-center justify-center cursor-pointer transition-colors w-full h-20 gap-2">
+                             <div className="flex items-center gap-2">
+                                <CloudUpload size={24} className="text-gray-400" />
+                                <span className="text-sm font-bold text-gray-600">اختيار ملفات (.pdf, .docx, .txt)</span>
+                             </div>
+                             {extractFilesAsIs.length > 0 && <span className="text-xs text-[#D4AF37] font-bold">تم إرفاق {extractFilesAsIs.length} ملف</span>}
                           </label>
                        </div>
                        
@@ -1662,11 +1751,14 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
                              placeholder="الصق المادة العلمية (محاضرات، ملخصات) هنا..."
                           />
                        </div>
-                       <div className="w-full relative">
-                          <input type="file" accept=".txt,.md,.pdf,.docx" onChange={(e) => handleFileUpload(e, 'smart')} className="hidden" id="file-upload-smart" />
-                          <label htmlFor="file-upload-smart" className="border border-dashed border-gray-300 hover:border-[#D4AF37] bg-white hover:bg-yellow-50 p-4 rounded-xl flex items-center justify-center cursor-pointer transition-colors w-full h-12 gap-2">
-                             <CloudUpload size={20} className="text-gray-400" />
-                             <span className="text-sm font-bold text-gray-600">اختر ملف الشرح</span>
+                       <div className="w-full relative flex flex-col gap-2">
+                          <input type="file" multiple accept=".txt,.md,.pdf,.docx" onChange={(e) => handleFileUpload(e, 'smart')} className="hidden" id="file-upload-smart" />
+                          <label htmlFor="file-upload-smart" className="border border-dashed border-gray-300 hover:border-[#D4AF37] bg-white hover:bg-yellow-50 p-4 rounded-xl flex flex-col items-center justify-center cursor-pointer transition-colors w-full h-20 gap-2">
+                             <div className="flex items-center gap-2">
+                                <CloudUpload size={20} className="text-gray-400" />
+                                <span className="text-sm font-bold text-gray-600">اختر ملفات الشرح</span>
+                             </div>
+                             {extractFilesSmart.length > 0 && <span className="text-xs text-[#D4AF37] font-bold">تم إرفاق {extractFilesSmart.length} ملف</span>}
                           </label>
                        </div>
 
@@ -1683,6 +1775,34 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
                                 <option value="hard">صعب (حالات سريرية)</option>
                              </select>
                           </div>
+                          <div className="col-span-2">
+                             <label className="block text-xs font-bold text-gray-600 mb-1">نوع الأسئلة (صح وخطأ / اختيارات)</label>
+                             <select value={extractRatioMode} onChange={e => setExtractRatioMode(e.target.value)} className="w-full bg-[#FAF9F6] border border-gray-200 rounded-xl px-3 py-2 text-sm font-bold text-gray-900 outline-none focus:border-[#D4AF37]">
+                                <option value="mcq_only">اختيار من متعدد فقط (100% MCQ)</option>
+                                <option value="mixed">مختلط (تحديد النسبة)</option>
+                                <option value="tf_only">صح وخطأ فقط (100% T/F)</option>
+                             </select>
+                          </div>
+                          {extractRatioMode === 'mixed' && (
+                              <div className="col-span-2">
+                                  <label className="block text-xs font-bold text-gray-600 mb-2">
+                                      نسبة الصح والخطأ مقابل الاختيارات (الحالي: {extractRatioPercentage}% MCQ, {100 - extractRatioPercentage}% T/F)
+                                  </label>
+                                  <input 
+                                      type="range" 
+                                      min="10" 
+                                      max="90" 
+                                      step="10"
+                                      value={extractRatioPercentage} 
+                                      onChange={(e) => setExtractRatioPercentage(Number(e.target.value))}
+                                      className="w-full accent-[#D4AF37]"
+                                  />
+                                  <div className="flex justify-between text-xs text-gray-400 font-bold mt-1">
+                                      <span>أكثر T/F</span>
+                                      <span>أكثر MCQ</span>
+                                  </div>
+                              </div>
+                          )}
                        </div>
 
                        <div>
@@ -1764,7 +1884,15 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
                                     {banks.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}
                                   </select>
                               </div>
-                              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                              <div>
+                                 <label className="block text-sm font-bold text-gray-700 mb-1">نوع السؤال</label>
+                                 <select value={manualForm.type || 'mcq'} onChange={e => setManualForm({...manualForm, type: e.target.value})} className="w-full bg-[#FAF9F6] border border-gray-200 rounded-xl px-3 py-2 text-sm text-gray-800 font-bold outline-none focus:border-[#D4AF37]">
+                                   <option value="mcq">اختيار من متعدد (MCQ)</option>
+                                   <option value="essay">مقالي (Essay)</option>
+                                 </select>
+                              </div>
+                              {(!manualForm.type || manualForm.type === 'mcq') && (
+                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                                   {manualForm.options.map((opt, i) => (
                                       <div key={i}>
                                          <label className="flex top-0 items-center gap-2 text-sm font-bold text-gray-700 mb-1">
@@ -1778,9 +1906,10 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
                                          }} className={`w-full bg-[#FAF9F6] border rounded-xl p-2.5 text-sm focus:border-[#D4AF37] outline-none ${manualForm.correct === i ? 'border-green-400 bg-green-50' : 'border-gray-200'}`} />
                                       </div>
                                   ))}
-                              </div>
+                                </div>
+                              )}
                               <div>
-                                 <label className="block text-sm font-bold text-gray-700 mb-1">التفسير (العربي)</label>
+                                 <label className="block text-sm font-bold text-gray-700 mb-1">{manualForm.type === 'essay' ? 'الإجابة النموذجية للسؤال المقالي' : 'التفسير (العربي)'}</label>
                                  <textarea value={manualForm.explanation} onChange={e => setManualForm({...manualForm, explanation: e.target.value})} className="w-full bg-[#FAF9F6] border border-gray-200 rounded-xl p-3 text-sm focus:border-[#D4AF37] outline-none h-20" />
                               </div>
                               <div className="flex justify-end gap-3 pt-4 border-t border-gray-100">
@@ -1825,14 +1954,14 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
                    return (
                      <>
                        {filteredDrafts.length === 0 && !showManualForm && <p className="text-gray-500 font-bold text-center py-6 bg-gray-50 rounded-2xl border border-dashed border-gray-200">لا توجد أسئلة مسودة حالياً في هذا المجلد.</p>}
-                {filteredDrafts.map(draft => (
+                {filteredDrafts.slice(0, visibleDraftsCount).map(draft => (
                   <div key={draft.id} className={`bg-white p-6 rounded-2xl border ${selectedDrafts.includes(draft.id) ? 'border-[#D4AF37] shadow-md ring-1 ring-[#D4AF37]/50' : 'border-[#D4AF37]/30 shadow-sm'} flex flex-col gap-4 transition-all`}>
                     <div className="flex justify-between items-start gap-4">
                       <label className="flex items-start gap-3 cursor-pointer group flex-1">
                           <input type="checkbox" className="w-5 h-5 mt-1 accent-[#D4AF37]" 
                                  checked={selectedDrafts.includes(draft.id)} 
                                  onChange={() => setSelectedDrafts(prev => prev.includes(draft.id) ? prev.filter(id => id !== draft.id) : [...prev, draft.id])} />
-                          <h4 className="font-bold text-lg text-[#121212] leading-relaxed max-w-3xl group-hover:text-[#D4AF37] transition-colors">{draft.text}</h4>
+                          <h4 className="font-bold text-lg text-[#121212] leading-relaxed max-w-3xl group-hover:text-[#D4AF37] transition-colors" dir="auto">{draft.text}</h4>
                       </label>
                       <button onClick={() => startEditingDraft(draft)} className="text-[#D4AF37] hover:text-[#C5A059] bg-[#D4AF37]/10 p-2 rounded-xl transition-colors shadow-sm whitespace-nowrap">
                         <Edit size={16} className="inline-block ml-1" /> تعديل
@@ -1868,6 +1997,14 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
                     </div>
                   </div>
                 ))}
+                        {filteredDrafts.length > visibleDraftsCount && (
+                             <button 
+                                 onClick={() => setVisibleDraftsCount(prev => prev + 50)} 
+                                 className="w-full text-[#D4AF37] font-bold border border-[#D4AF37]/30 hover:bg-[#D4AF37]/10 py-3 rounded-xl transition-colors shadow-sm mt-6"
+                             >
+                                 تحميل المزيد من المسودات ({filteredDrafts.length - visibleDraftsCount} مسودات متبقية)
+                             </button>
+                        )}
                      </>
                    );
                  })()}
@@ -1882,7 +2019,7 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
                 exit={{ opacity: 0 }}
-                className="fixed inset-0 bg-black/60 backdrop-blur-[2px] z-50 flex items-center justify-center p-4"
+                className="fixed inset-0 bg-black/60 backdrop-blur-[2px] z-50 flex items-start justify-center p-4 pt-10 pb-10 overflow-y-auto"
               >
                 <motion.div
                   initial={{ scale: 0.95, opacity: 0, y: 20 }}
@@ -1967,21 +2104,78 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
               <div className="flex flex-col md:flex-row items-center justify-between gap-4">
                 <h2 className="text-2xl font-bold border-b-2 border-[#D4AF37] pb-2 inline-block">البنوك النهائية للطلاب</h2>
                 <div className="flex gap-2 w-full md:w-auto">
-                    <button onClick={() => {
-                        const element = document.getElementById('live-questions-list');
-                        if (element) {
-                            // @ts-ignore
-                            import('html2pdf.js').then((html2pdf) => {
-                                html2pdf.default().set({
-                                    margin: 10,
-                                    filename: 'live_bank_questions.pdf',
-                                    html2canvas: { scale: 2 },
-                                    jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' }
-                                }).from(element).save();
-                            });
+                    <button onClick={async () => {
+                        const qs = liveQuestions.filter(q => selectedLiveBankFilter === '' || q.bankId === selectedLiveBankFilter);
+                        if (qs.length === 0) {
+                            alert('لا توجد أسئلة لتحميلها');
+                            return;
                         }
-                    }} className="bg-white text-gray-800 border-2 border-[#D4AF37] shadow-md hover:shadow-lg hover:-translate-y-1 transition-all duration-300 font-bold py-3 px-6 rounded-xl flex items-center justify-center gap-2 text-sm flex-1 md:flex-none">
-                      تحميل الأسئلة PDF
+
+                        const bankName = selectedLiveBankFilter ? banks.find(b => b.id === selectedLiveBankFilter)?.name : 'جميع_الأسئلة';
+                        if (downloadingBankId === bankName) return;
+                        setDownloadingBankId(bankName);
+                        
+                        try {
+                            let html = `
+                                <div style="background: #fff; width: 100%; direction: ltr; margin: 0 auto; min-height: 100%;">
+                                    <div style="padding: 20px; font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; color: #000;">
+                                        <!-- Cover Page -->
+                                        <div style="padding: 60px 20px; margin-bottom: 40px; text-align: center; border-bottom: 2px solid #eee; page-break-after: always; break-after: page; direction: rtl;">
+                                            <div style="font-size: 80px; font-weight: bold; color: #D4AF37; margin-bottom: 20px;">T</div>
+                                            <h1 style="color: #1a1a1a; font-size: 42px; margin-bottom: 10px; font-weight: 900;">Tamrediano</h1>
+                                            <h2 style="color: #666; font-size: 24px; margin-bottom: 40px;">تمريضيانو - منصة التمريض</h2>
+                                            <h3 style="color: #1a1a1a; font-size: 32px; margin-bottom: 10px;">${bankName}</h3>
+                                        </div>
+                            `;
+
+                            qs.forEach((q, index) => {
+                                html += `
+                                    <div style="margin-bottom: 30px; page-break-inside: avoid; border-bottom: 1px solid #eee; padding-bottom: 20px;">
+                                        <h3 style="font-size: 18px; color: #1a1a1a; margin-bottom: 15px; text-align: left; direction: ltr;">${index + 1}. ${q.text}</h3>
+                                        ${q.imageUrl ? `<img src="${q.imageUrl}" style="max-height: 250px; display: block; margin: 0 auto 15px auto; border-radius: 8px;" />` : ''}
+                                        <div style="margin-bottom: 15px;">
+                                `;
+                                
+                                q.options.forEach((opt: string, oIndex: number) => {
+                                    html += `
+                                        <div style="padding: 12px; border: 1px solid #e2e8f0; border-radius: 8px; margin-bottom: 8px; font-size: 15px; text-align: left; direction: ltr; background-color: #f8fafc;">
+                                            <strong style="margin-right: 12px; color: #64748b;">${String.fromCharCode(65 + oIndex)}.</strong> <span style="color: #334155;">${opt}</span>
+                                        </div>
+                                    `;
+                                });
+
+                                html += `</div>`;
+
+                                if (q.explanation) {
+                                    html += `
+                                        <div style="background-color: #fefce8; border-right: 4px solid #D4AF37; padding: 15px; border-radius: 6px; font-size: 14px; color: #444; direction: rtl; text-align: right;">
+                                            <strong style="display: block; margin-bottom: 8px; color: #000; font-size: 15px;">الإجابة الصحيحة (${String.fromCharCode(65 + q.correct)}) - التوضيح:</strong>
+                                            <div style="line-height: 1.6;">${q.explanation.replace(/\n/g, '<br/>')}</div>
+                                        </div>
+                                    `;
+                                }
+
+                                html += `</div>`;
+                            });
+
+                            html += `</div></div>`;
+                            const html2pdf = await import('html2pdf.js');
+                            await html2pdf.default().set({
+                                margin: [10, 10, 10, 10],
+                                filename: `${bankName}_Questions.pdf`,
+                                image: { type: 'jpeg', quality: 0.98 },
+                                html2canvas: { scale: 2, useCORS: true, logging: false },
+                                jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' },
+                                pagebreak: { mode: ['avoid-all', 'css', 'legacy'] }
+                            } as any).from(html).save();
+                        } catch(e) {
+                            alert('فشلت الطباعة');
+                        } finally {
+                            setDownloadingBankId(null);
+                        }
+                    }} className={`bg-white text-gray-800 border-2 border-[#D4AF37] shadow-md hover:shadow-lg hover:-translate-y-1 transition-all duration-300 font-bold py-3 px-6 rounded-xl flex items-center justify-center gap-2 text-sm flex-1 md:flex-none ${selectedLiveBankFilter ? downloadingBankId === (banks.find(b => b.id === selectedLiveBankFilter)?.name ?? 'جميع_الأسئلة') ? 'opacity-70 cursor-not-allowed' : '' : downloadingBankId === 'جميع_الأسئلة' ? 'opacity-70 cursor-not-allowed' : ''}`} disabled={selectedLiveBankFilter ? downloadingBankId === (banks.find(b => b.id === selectedLiveBankFilter)?.name ?? 'جميع_الأسئلة') : downloadingBankId === 'جميع_الأسئلة'}>
+                      {selectedLiveBankFilter ? downloadingBankId === (banks.find(b => b.id === selectedLiveBankFilter)?.name ?? 'جميع_الأسئلة') ? <div className="w-4 h-4 border-2 border-gray-400 border-t-gray-600 rounded-full animate-spin"></div> : null : downloadingBankId === 'جميع_الأسئلة' ? <div className="w-4 h-4 border-2 border-gray-400 border-t-gray-600 rounded-full animate-spin"></div> : null}
+                      {selectedLiveBankFilter ? downloadingBankId === (banks.find(b => b.id === selectedLiveBankFilter)?.name ?? 'جميع_الأسئلة') ? 'يجهز...' : 'تحميل الأسئلة PDF' : downloadingBankId === 'جميع_الأسئلة' ? 'يجهز...' : 'تحميل الأسئلة PDF'}
                     </button>
                     <button onClick={createBank} className="bg-gradient-to-r from-[#D4AF37] to-[#C5A059] text-white font-bold py-3 px-6 rounded-xl shadow-lg hover:shadow-xl hover:-translate-y-1 transition-all duration-300 flex items-center justify-center gap-2 text-sm flex-1 md:flex-none">
                       <Plus size={16} /> إضافة مجلد (بنك)
@@ -2068,55 +2262,70 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
                      </div>
                  </div>
                  
-                 {liveQuestions
-                    .filter(q => selectedLiveBankFilter === '' || q.bankId === selectedLiveBankFilter)
-                    .map((q) => {
-                    const failureRate = calculateFailureRate(q);
-                    const isHighFailure = failureRate > 60;
+                 {(() => {
+                    const filteredLiveQuestions = liveQuestions.filter(q => selectedLiveBankFilter === '' || q.bankId === selectedLiveBankFilter);
+                    const slicedLiveQuestions = filteredLiveQuestions.slice(0, visibleLiveCount);
                     return (
-                    <div key={q.id} className={`p-5 rounded-xl border flex flex-col gap-3 shadow-sm transition-all ${selectedLiveQs.includes(q.id) ? 'border-[#D4AF37] bg-white ring-1 ring-[#D4AF37]/50' : (isHighFailure ? 'border-red-400 bg-red-50' : 'border-gray-200 bg-white')}`}>
-                       <div className="flex justify-between items-start">
-                          <label className="flex items-start gap-3 cursor-pointer group flex-1">
-                              <input type="checkbox" className="w-5 h-5 mt-1 accent-[#D4AF37]" 
-                                     checked={selectedLiveQs.includes(q.id)} 
-                                     onChange={() => setSelectedLiveQs(prev => prev.includes(q.id) ? prev.filter(id => id !== q.id) : [...prev, q.id])} />
-                              <div className="flex flex-col gap-1 max-w-2xl">
-                                 {isHighFailure && <span className="bg-red-600 text-white text-[10px] px-2 py-0.5 rounded font-bold self-start mb-1 tracking-wider uppercase">High Failure Rate: {Math.round(failureRate)}%</span>}
-                                 <p className={`font-bold text-sm leading-relaxed ${selectedLiveQs.includes(q.id) ? 'text-[#D4AF37]' : 'text-[#121212]'} transition-colors group-hover:text-[#D4AF37]`}>{q.text}</p>
-                              </div>
-                          </label>
-                          <span className="text-[10px] text-gray-500 font-bold bg-gray-100 px-2 py-1 rounded shadow-sm border border-gray-200 whitespace-nowrap ml-2">
-                            {banks.find(b => b.id === q.bankId)?.name || 'مجهول'}
-                          </span>
-                       </div>
-                       <div className="flex flex-wrap items-center justify-end gap-2 mt-2 pt-2 border-t border-gray-100">
-                          {q.imageUrl && <span className="mr-auto text-xs text-blue-600 font-bold bg-blue-50 px-2 py-1 rounded">يحتوي على صورة</span>}
-                          <label className="cursor-pointer text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200 px-3 py-1.5 rounded-lg text-xs font-bold transition-colors shadow-sm">
-                             رفع صورة
-                             <input type="file" accept="image/*" className="hidden" onChange={(e) => {
-                                 const file = e.target.files?.[0];
-                                 if (file) {
-                                     const reader = new FileReader();
-                                     reader.onloadend = async () => {
-                                         await updateDoc(doc(db, 'live_banks', q.id), { imageUrl: reader.result });
-                                         setLiveQuestions(prev => prev.map(lq => lq.id === q.id ? {...lq, imageUrl: reader.result} : lq));
-                                     };
-                                     reader.readAsDataURL(file);
-                                 }
-                             }} />
-                          </label>
-                          <button onClick={() => retractToDraft(q)} className="text-yellow-700 bg-yellow-50 hover:bg-yellow-100 border border-yellow-200 px-3 py-1.5 rounded-lg text-xs font-bold transition-colors shadow-sm">إرجاع للمسودة (للتعديل)</button>
-                          <button onClick={() => deleteLiveQuestion(q.id)} className="text-red-700 bg-red-50 hover:bg-red-100 border border-red-200 px-3 py-1.5 rounded-lg text-xs font-bold transition-colors shadow-sm">حذف نهائي</button>
-                       </div>
-                    </div>
-                 )})}
+                        <>
+                            {slicedLiveQuestions.map((q) => {
+                            const failureRate = calculateFailureRate(q);
+                            const isHighFailure = failureRate > 60;
+                            return (
+                            <div key={q.id} className={`p-5 rounded-xl border flex flex-col gap-3 shadow-sm transition-all ${selectedLiveQs.includes(q.id) ? 'border-[#D4AF37] bg-white ring-1 ring-[#D4AF37]/50' : (isHighFailure ? 'border-red-400 bg-red-50' : 'border-gray-200 bg-white')}`}>
+                               <div className="flex justify-between items-start">
+                                  <label className="flex items-start gap-3 cursor-pointer group flex-1">
+                                      <input type="checkbox" className="w-5 h-5 mt-1 accent-[#D4AF37]" 
+                                             checked={selectedLiveQs.includes(q.id)} 
+                                             onChange={() => setSelectedLiveQs(prev => prev.includes(q.id) ? prev.filter(id => id !== q.id) : [...prev, q.id])} />
+                                      <div className="flex flex-col gap-1 max-w-2xl">
+                                         {isHighFailure && <span className="bg-red-600 text-white text-[10px] px-2 py-0.5 rounded font-bold self-start mb-1 tracking-wider uppercase">High Failure Rate: {Math.round(failureRate)}%</span>}
+                                         <p className={`font-bold text-sm leading-relaxed ${selectedLiveQs.includes(q.id) ? 'text-[#D4AF37]' : 'text-[#121212]'} transition-colors group-hover:text-[#D4AF37]`} dir="auto">{q.text}</p>
+                                      </div>
+                                  </label>
+                                  <span className="text-[10px] text-gray-500 font-bold bg-gray-100 px-2 py-1 rounded shadow-sm border border-gray-200 whitespace-nowrap ml-2">
+                                    {banks.find(b => b.id === q.bankId)?.name || 'مجهول'}
+                                  </span>
+                               </div>
+                               <div className="flex flex-wrap items-center justify-end gap-2 mt-2 pt-2 border-t border-gray-100">
+                                  {q.imageUrl && <span className="mr-auto text-xs text-blue-600 font-bold bg-blue-50 px-2 py-1 rounded">يحتوي على صورة</span>}
+                                  <label className="cursor-pointer text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200 px-3 py-1.5 rounded-lg text-xs font-bold transition-colors shadow-sm">
+                                     رفع صورة
+                                     <input type="file" accept="image/*" className="hidden" onChange={(e) => {
+                                         const file = e.target.files?.[0];
+                                         if (file) {
+                                             const reader = new FileReader();
+                                             reader.onloadend = async () => {
+                                                 await updateDoc(doc(db, 'live_banks', q.id), { imageUrl: reader.result });
+                                                 setLiveQuestions(prev => prev.map(lq => lq.id === q.id ? {...lq, imageUrl: reader.result} : lq));
+                                             };
+                                             reader.readAsDataURL(file);
+                                         }
+                                     }} />
+                                  </label>
+                                  <button onClick={() => retractToDraft(q)} className="text-yellow-700 bg-yellow-50 hover:bg-yellow-100 border border-yellow-200 px-3 py-1.5 rounded-lg text-xs font-bold transition-colors shadow-sm">إرجاع للمسودة (للتعديل)</button>
+                                  <button onClick={() => deleteLiveQuestion(q.id)} className="text-red-700 bg-red-50 hover:bg-red-100 border border-red-200 px-3 py-1.5 rounded-lg text-xs font-bold transition-colors shadow-sm">حذف نهائي</button>
+                               </div>
+                            </div>
+                            )})}
+                            
+                            {filteredLiveQuestions.length > visibleLiveCount && (
+                                <button 
+                                    onClick={() => setVisibleLiveCount(prev => prev + 50)} 
+                                    className="w-full text-[#D4AF37] font-bold border border-[#D4AF37]/30 hover:bg-[#D4AF37]/10 py-3 rounded-xl transition-colors shadow-sm mb-4"
+                                >
+                                    تحميل المزيد من الأسئلة ({filteredLiveQuestions.length - visibleLiveCount} أسئلة متبقية)
+                                </button>
+                            )}
+                        </>
+                    )
+                 })()}
                  {liveQuestions.length === 0 && <p className="text-gray-500 font-bold text-sm">لا توجد أسئلة منشورة.</p>}
               </div>
 
               <div className="mt-8 space-y-4">
                  <h3 className="text-lg font-bold text-[#D4AF37]">لوحة الشرف والمراقبة (Leaderboard)</h3>
-                 <div className="bg-white rounded-2xl border border-[#D4AF37]/30 overflow-hidden shadow-sm">
-                    <table className="w-full text-right text-sm">
+                 <div className="bg-white rounded-2xl border border-[#D4AF37]/30 overflow-x-auto shadow-sm w-full">
+                    <table className="w-full text-right text-sm min-w-[600px]">
                         <thead className="bg-[#FAF9F6] border-b border-gray-200 text-gray-500 text-xs uppercase tracking-widest font-bold">
                             <tr>
                                 <th className="p-4">الطالب</th>
@@ -2155,8 +2364,8 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
           {!loading && activeTab === 'reports' && (
              <div className="space-y-6">
                 <h2 className="text-2xl font-bold border-b-2 border-[#D4AF37] pb-2 inline-block">تقارير ونتائج الطلاب</h2>
-                <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden shadow-sm">
-                   <table className="w-full text-right text-sm">
+                <div className="bg-white rounded-2xl border border-gray-200 overflow-x-auto shadow-sm w-full">
+                   <table className="w-full text-right text-sm min-w-[700px]">
                        <thead className="bg-[#FAF9F6] border-b border-gray-200 text-gray-500 text-xs uppercase tracking-widest font-bold">
                            <tr>
                                <th className="p-4 rounded-tr-2xl">الطالب</th>
@@ -2168,13 +2377,17 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
                            </tr>
                        </thead>
                        <tbody className="divide-y divide-gray-100">
-                           {examResults.sort((a,b) => (b.createdAt?.toMillis() || 0) - (a.createdAt?.toMillis() || 0)).map((res, idx) => (
+                           {examResults.sort((a,b) => {
+                               const timeA = a.createdAt?.toMillis ? a.createdAt.toMillis() : (a.createdAt instanceof Date ? a.createdAt.getTime() : 0);
+                               const timeB = b.createdAt?.toMillis ? b.createdAt.toMillis() : (b.createdAt instanceof Date ? b.createdAt.getTime() : 0);
+                               return timeB - timeA;
+                           }).map((res, idx) => (
                                <tr key={res.id} className="hover:bg-gray-50 transition-colors">
                                    <td className="p-4 font-bold text-[#121212]">{getStudentDisplayName(res.studentId, res.studentName)}</td>
                                    <td className="p-4"><span className="text-green-700 font-bold bg-green-50 px-2.5 py-1 rounded-lg border border-green-200 shadow-sm">{res.score}</span> / {res.total}</td>
                                    <td className="p-4 text-gray-700 font-medium">{res.timeTaken} دقيقة</td>
                                    <td className="p-4 text-gray-600 font-medium text-xs">{getBankDisplayName(res.bankId, res.bankName)}</td>
-                                   <td className="p-4 text-gray-400 text-xs font-bold">{res.createdAt?.toDate().toLocaleDateString() || '-'}</td>
+                                   <td className="p-4 text-gray-400 text-xs font-bold">{res.createdAt?.toDate ? res.createdAt.toDate().toLocaleDateString() : (res.createdAt instanceof Date ? res.createdAt.toLocaleDateString() : '-')}</td>
                                    <td className="p-4">
                                         <button onClick={() => deleteExamResult(res.id)} className="text-red-500 hover:text-red-700 bg-red-50 hover:bg-red-100 p-2 rounded-lg transition-colors">
                                             <Trash size={16} />
@@ -2237,7 +2450,11 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
                 <h2 className="text-2xl font-bold border-b-2 border-[#D4AF37] pb-2 inline-block mt-8">تقييمات وآراء الطلاب</h2>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   {feedbacks.length === 0 && <p className="text-gray-500 font-bold">لا توجد تقييمات حالياً.</p>}
-                  {feedbacks.sort((a,b) => (b.createdAt?.toMillis() || 0) - (a.createdAt?.toMillis() || 0)).map((fb) => (
+                  {feedbacks.sort((a,b) => {
+                     const timeA = a.createdAt?.toMillis ? a.createdAt.toMillis() : (a.createdAt instanceof Date ? a.createdAt.getTime() : 0);
+                     const timeB = b.createdAt?.toMillis ? b.createdAt.toMillis() : (b.createdAt instanceof Date ? b.createdAt.getTime() : 0);
+                     return timeB - timeA;
+                 }).map((fb) => (
                      <div key={fb.id} className="bg-white p-5 rounded-xl border border-gray-200 shadow-sm flex flex-col gap-2">
                         <div className="flex justify-between items-center">
                            <div className="flex flex-col">
@@ -2380,8 +2597,8 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
                    {/* Column 2: Activity & Access Log */}
                    <div>
                       <h2 className="text-xl font-bold text-gray-800 mb-4">سجل النشاط والدخول (Activity Log)</h2>
-                      <div className="bg-white rounded-2xl border border-gray-200 shadow-sm overflow-hidden">
-                         <table className="w-full text-right text-sm">
+                      <div className="bg-white rounded-2xl border border-gray-200 shadow-sm overflow-x-auto w-full">
+                         <table className="w-full text-right text-sm min-w-[400px]">
                             <thead className="bg-[#FAF9F6] border-b border-gray-200 text-gray-500 text-[10px] uppercase tracking-widest font-bold">
                                 <tr>
                                     <th className="p-3">اسم الطالب (آخر دخول)</th>
@@ -2396,8 +2613,13 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
                                          <p className="text-[10px] text-gray-400 font-medium">آخر دخول: {u.lastLogin ? u.lastLogin.toDate().toLocaleString() : 'غير متوفر'}</p>
                                          {u.deviceInfo && <p className="text-[10px] text-blue-500 font-bold mt-1 bg-blue-50/50 inline-block px-1 rounded">{u.deviceInfo}</p>}
                                       </td>
-                                      <td className="p-3 text-[10px] text-gray-500 leading-relaxed font-mono">
-                                         {u.ips?.map((ip: string) => <div key={ip}>{ip}</div>) || 'لا يوجد'}
+                                      <td className="p-3 relative group text-[10px] text-gray-500 leading-relaxed font-mono">
+                                         <div className="flex justify-between items-center gap-2">
+                                           <div>{u.ips?.map((ip: string) => <div key={ip}>{ip}</div>) || 'لا يوجد'}</div>
+                                           <button onClick={() => handleBanStudent(u.id, u.fullName)} className="text-[10px] font-bold bg-white text-red-600 border border-red-200 px-2 py-1 rounded shadow-sm hover:bg-red-50 shrink-0">
+                                              حظر الطالب
+                                           </button>
+                                         </div>
                                       </td>
                                    </tr>
                                 ))}
@@ -2413,18 +2635,23 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
           {/* BANS TAB */}
           {!loading && activeTab === 'bans' && (
              <div className="space-y-6">
-                <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
-                  <h2 className="text-2xl font-bold border-b-2 border-red-600 text-red-600 pb-2 inline-block">الأمن والحظر (Security/Bans)</h2>
+                <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 bg-gray-50 border border-gray-200 p-4 rounded-2xl shadow-sm mb-6">
+                  <h2 className="text-xl font-bold border-r-4 border-red-500 pr-3 text-gray-800 flex items-center gap-2">
+                     <ShieldAlert className="text-red-500" size={24} />
+                     <span>الأمن والحظر (Security)</span>
+                  </h2>
                   
-                  <div className="relative w-full md:w-64">
+                  <div className="relative w-full md:w-80">
                     <input 
                        type="text" 
-                       placeholder="بحث في المتواجدين الآن..." 
+                       placeholder="ابحث برقم التسجيل أو الاسم..." 
                        value={onlineSearchTerm}
                        onChange={e => setOnlineSearchTerm(e.target.value)}
-                       className="w-full pl-10 pr-4 py-2 bg-white border border-gray-200 rounded-xl text-sm font-bold focus:border-[#D4AF37] outline-none shadow-sm"
+                       className="w-full pl-4 pr-12 py-3 bg-white border border-gray-200 rounded-xl text-sm font-bold focus:border-[#D4AF37] focus:ring-2 focus:ring-[#D4AF37]/20 outline-none shadow-sm transition-all text-gray-700"
                     />
-                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" size={16} />
+                    <div className="absolute right-3 top-1/2 -translate-y-1/2 bg-gray-100 p-1.5 rounded-lg text-gray-500">
+                      <Search size={16} />
+                    </div>
                   </div>
                 </div>
 
@@ -2435,28 +2662,49 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
                          الطلاب المحظورين
                       </h3>
                       <div className="flex flex-col gap-3">
-                         {users.filter(u => (u.ips && u.ips.length > 3) || strikes.find(s => s.id === u.id)?.banned).map(u => (
-                            <div key={u.id} className="bg-red-50 p-4 rounded-2xl border border-red-100 shadow-sm flex flex-col gap-3">
-                               <div className="flex items-center gap-3">
-                                  <div className="w-10 h-10 bg-red-100 text-red-600 rounded-full flex items-center justify-center shrink-0">
-                                     <ShieldAlert size={20} />
+                         {(() => {
+                            const bannedUsers = users.filter(u => (u.ips && u.ips.length > 3) || strikes.find(s => s.id === u.id)?.banned);
+                            const standaloneStrikes = strikes.filter(s => s.banned && !users.some(u => u.id === s.id));
+                            
+                            const itemsToRender = [
+                               ...bannedUsers.map(u => ({
+                                   id: u.id,
+                                   name: getStudentDisplayName(u.id, u.fullName),
+                                   label: 'محظور من النظام'
+                               })),
+                               ...standaloneStrikes.map(s => ({
+                                   id: s.id,
+                                   name: s.studentName || s.id,
+                                   label: 'حظر جهاز / IP'
+                               }))
+                            ];
+
+                            if (itemsToRender.length === 0) {
+                               return (
+                                  <div className="text-center py-8">
+                                     <ShieldAlert size={32} className="mx-auto text-green-500 mb-2 opacity-50" />
+                                     <p className="text-gray-500 font-bold text-sm">لا يوجد طلاب محظورين حالياً.</p>
                                   </div>
-                                  <div>
-                                     <h3 className="font-bold text-gray-900 text-sm">{getStudentDisplayName(u.id, u.fullName)}</h3>
-                                     <p className="text-[10px] text-red-700 font-bold opacity-80 mt-0.5">محظور من النظام</p>
+                               );
+                            }
+
+                            return itemsToRender.map(item => (
+                               <div key={item.id} className="bg-red-50 p-4 rounded-2xl border border-red-100 shadow-sm flex flex-col gap-3">
+                                  <div className="flex items-center gap-3">
+                                     <div className="w-10 h-10 bg-red-100 text-red-600 rounded-full flex items-center justify-center shrink-0">
+                                        <ShieldAlert size={20} />
+                                     </div>
+                                     <div>
+                                        <h3 className="font-bold text-gray-900 text-sm">{item.name}</h3>
+                                        <p className="text-[10px] text-red-700 font-bold opacity-80 mt-0.5">{item.label} ({item.id})</p>
+                                     </div>
                                   </div>
+                                  <button onClick={() => handleUnban(item.id)} className="w-full bg-white hover:bg-gray-50 text-gray-800 border border-gray-200 font-bold py-1.5 rounded-lg shadow-sm text-xs transition-colors mt-auto">
+                                     فك الحظر وتسوية الحساب
+                                  </button>
                                </div>
-                               <button onClick={() => handleUnban(u.id)} className="w-full bg-white hover:bg-gray-50 text-gray-800 border border-gray-200 font-bold py-1.5 rounded-lg shadow-sm text-xs transition-colors mt-auto">
-                                  فك الحظر وتسوية الحساب
-                               </button>
-                            </div>
-                         ))}
-                         {users.filter(u => (u.ips && u.ips.length > 3) || strikes.find(s => s.id === u.id)?.banned).length === 0 && (
-                            <div className="text-center py-8">
-                               <ShieldAlert size={32} className="mx-auto text-green-500 mb-2 opacity-50" />
-                               <p className="text-gray-500 font-bold text-sm">لا يوجد طلاب محظورين حالياً.</p>
-                            </div>
-                         )}
+                            ));
+                         })()}
                       </div>
                    </div>
 
@@ -2631,32 +2879,33 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
               <div className="space-y-6">
                  <h2 className="text-2xl font-bold border-b-2 border-[#D4AF37] pb-2 inline-flex items-center gap-2"><Headset className="text-[#D4AF37]" size={24}/> تذاكر الدعم الفني والمحادثات المباشرة</h2>
                  
-                 <div className="flex gap-6 h-[600px]">
-                    <div className="w-1/3 bg-white border border-gray-200 rounded-2xl shadow-sm flex flex-col overflow-hidden">
+                 <div className="flex flex-col lg:flex-row gap-6 h-auto lg:h-[600px]">
+                    <div className="w-full lg:w-1/3 min-h-[300px] bg-white border border-gray-200 rounded-2xl shadow-sm flex flex-col overflow-hidden">
                        <h3 className="bg-gray-50 border-b border-gray-200 p-4 font-bold text-gray-800 text-sm">المحادثات المفتوحة (حسب الجهاز)</h3>
-                       <div className="flex-1 overflow-y-auto p-2 space-y-2">
+                       <div className="flex-1 overflow-y-auto max-h-[300px] lg:max-h-full p-2 space-y-2">
                            {Array.from(new Set(supportChats.map(c => c.deviceId))).map(devId => {
                                const chatMessages = supportChats.filter(c => c.deviceId === devId);
                                const lastMsg = chatMessages[chatMessages.length - 1];
+                               const studentMsg = chatMessages.slice().reverse().find(m => m.sender === 'student');
                                return (
                                    <div 
                                       key={devId} 
                                       onClick={() => setSelectedChatId(devId)}
                                       className={`p-3 rounded-xl border ${selectedChatId === devId ? 'bg-blue-50 border-blue-200' : 'bg-white border-gray-100 hover:bg-gray-50'} cursor-pointer transition-colors`}
                                    >
-                                      <h4 className="font-bold text-xs truncate max-w-full text-gray-900">{getStudentDisplayName(devId, lastMsg?.studentName)}</h4>
+                                      <h4 className="font-bold text-xs truncate max-w-full text-gray-900">{getStudentDisplayName(devId, studentMsg?.studentName || 'غير معروف')}</h4>
                                       <p className="text-[10px] text-gray-500 truncate mt-1">{lastMsg?.message}</p>
                                    </div>
                                );
                            })}
                        </div>
                     </div>
-                    <div className="flex-1 bg-white border border-gray-200 rounded-2xl shadow-sm flex flex-col overflow-hidden">
+                    <div className="flex-1 w-full min-h-[400px] lg:min-h-0 bg-white border border-gray-200 rounded-2xl shadow-sm flex flex-col overflow-hidden">
                        {selectedChatId ? (
                            <>
                              <div className="bg-gray-900 p-4 text-white flex items-center justify-between">
                                  <div>
-                                     <h3 className="font-bold text-sm">محادثة مع جهاز: {selectedChatId}</h3>
+                                     <h3 className="font-bold text-sm">محادثة مع: {getStudentDisplayName(selectedChatId, supportChats.filter(c => c.deviceId === selectedChatId).slice().reverse().find(m => m.sender === 'student')?.studentName || 'غير معروف')}</h3>
                                      {supportChats.filter(c => c.deviceId === selectedChatId).find(c => c.bankName)?.bankName && (
                                          <p className="text-[10px] text-gray-300 mt-1 font-bold">
                                              القسم: {supportChats.filter(c => c.deviceId === selectedChatId).find(c => c.bankName)?.bankName}
@@ -2685,12 +2934,48 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
                                      </button>
                                      <button 
                                          onClick={() => {
+                                             setConfirmDialog({ message: 'هل أنت متأكد من حظر هذا الجهاز / الطالب نهائياً؟', onConfirm: async () => {
+                                                 try {
+                                                     const studentName = supportChats.filter(c => c.deviceId === selectedChatId).slice(-1)[0]?.studentName || 'غير معروف';
+                                                     // Ban device ID
+                                                     await setDoc(doc(db, 'strikes', selectedChatId), { count: 10, banned: true, studentName: studentName }, { merge: true });
+                                                     
+                                                     // Ban user ID if available and IPs
+                                                     const usersSnap = await getDocs(collection(db, 'users'));
+                                                     const userDoc = usersSnap.docs.find(d => d.data().fullName === studentName || d.data().name === studentName);
+                                                     if (userDoc) {
+                                                         await setDoc(doc(db, 'strikes', userDoc.id), { count: 10, banned: true, studentName: studentName }, { merge: true });
+                                                         
+                                                         // Ban associated IPs
+                                                         const userData = userDoc.data();
+                                                         if (userData.ips && Array.isArray(userData.ips)) {
+                                                             for (const ip of userData.ips) {
+                                                                 await setDoc(doc(db, 'strikes', ip), { count: 10, banned: true, studentName: studentName }, { merge: true });
+                                                             }
+                                                         }
+                                                     }
+                                                     
+                                                     alert('تم حظر الجهاز والطالب بنجاح.');
+                                                 } catch (err) {
+                                                     alert('حدث خطأ أثناء الحظر.');
+                                                 }
+                                             }});
+                                         }}
+                                         className="bg-red-600 hover:bg-red-700 text-white px-3 py-1.5 rounded-lg text-xs font-bold transition-colors flex items-center gap-1 shadow-sm"
+                                         title="تحويل الطالب إلى القائمة السوداء وحظر جهازه"
+                                     >
+                                         <ShieldAlert size={14} /> حظر الجهاز
+                                     </button>
+                                     <button 
+                                         onClick={() => {
                                              setConfirmDialog({ message: 'هل أنت متأكد من إنهاء هذه المحادثة ومسحها بالكامل؟', onConfirm: async () => {
                                                  try {
                                                      const chatsToDelete = supportChats.filter(c => c.deviceId === selectedChatId);
+                                                     const batch = writeBatch(db);
                                                      for (const chat of chatsToDelete) {
-                                                         await deleteDoc(doc(db, 'support_chats', chat.id));
+                                                         batch.delete(doc(db, 'support_chats', chat.id));
                                                      }
+                                                     await batch.commit();
                                                      setSelectedChatId(null);
                                                      alert('تم إنهاء المحادثة بنجاح.');
                                                  } catch(e) {
@@ -2756,7 +3041,7 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
                 exit={{ opacity: 0 }}
-                className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm"
+                className="fixed inset-0 z-50 flex items-start justify-center p-4 pt-10 pb-10 bg-black/40 backdrop-blur-sm overflow-y-auto"
                 dir="rtl"
               >
                 <motion.div 
@@ -2813,14 +3098,14 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
                 exit={{ opacity: 0 }}
-                className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm overflow-y-auto"
+                className="fixed inset-0 z-50 flex items-start justify-center p-4 pt-10 pb-10 bg-black/40 backdrop-blur-sm overflow-y-auto"
                 dir="rtl"
               >
                 <motion.div 
                   initial={{ scale: 0.95, y: 15 }}
                   animate={{ scale: 1, y: 0 }}
                   exit={{ scale: 0.95, y: 15 }}
-                  className="bg-white rounded-3xl border border-gray-200 shadow-2xl max-w-2xl w-full p-6 text-right space-y-6 my-8"
+                  className="bg-white rounded-3xl border border-gray-200 shadow-2xl max-w-2xl w-full p-6 text-right space-y-6 max-h-[90vh] overflow-y-auto"
                 >
                   <div className="flex justify-between items-center border-b border-gray-100 pb-3">
                      <h3 className="text-xl font-bold text-gray-900 flex items-center gap-2">
@@ -3013,7 +3298,7 @@ Example: ["أحمد محمد", "فاطمة علي"]`;
 
                      <div className="bg-[#FAF9F6] p-3 rounded-xl border border-[#D4AF37]/30 flex justify-between items-center">
                          <div className="flex items-center gap-2 text-xs font-bold text-gray-600 truncate">
-                             <span className="text-gray-400 truncate max-w-[200px]">{window.location.origin}/login?bank={selectedBankToConfigure.id}</span>
+                             <span className="text-gray-400 break-all w-full">{window.location.origin}/login?bank={selectedBankToConfigure.id}</span>
                          </div>
                          <button 
                              onClick={() => {
@@ -3091,7 +3376,7 @@ function PromptDialogLocal({ dialog, onClose }: { dialog: { message: string, def
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
-      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm"
+      className="fixed inset-0 z-50 flex items-start justify-center p-4 pt-10 pb-10 bg-black/40 backdrop-blur-sm overflow-y-auto"
       dir="rtl"
     >
       <motion.div 

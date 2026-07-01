@@ -7,14 +7,14 @@ import ReactMarkdown from 'react-markdown';
 import localforage from 'localforage';
 import { db, handleFirestoreError, OperationType } from '@/src/lib/firebase';
 import { doc, getDoc, setDoc, addDoc, increment, collection, serverTimestamp, getDocs, query, where, orderBy, onSnapshot, updateDoc } from 'firebase/firestore';
-import { useAuth } from '../context/AuthContext';
+import { useAuth } from '../../context/AuthContext';
 import { generateContentWithRetry } from '@/src/lib/gemini';
 
 import toast from 'react-hot-toast';
 
 const BAD_WORDS = ["شتيمة", "حمار", "كلب", "غبي", "stupid", "idiot", "shit", "fuck", "bitch"];
 
-export default function Exam() {
+export default function MobileExam() {
   const navigate = useNavigate();
   const { studentData, loginAdmin, loginStudent, logout } = useAuth();
   const [questions, setQuestions] = useState<any[]>([]);
@@ -362,7 +362,7 @@ export default function Exam() {
                       localStorage.removeItem('tamrediano_exam_time');
                       if (bankIdUrl) setShowModeSelect(bankIdUrl);
                   } else if (bankIdUrl === parsed.bankId) {
-                      // Only auto-resume if the URL specifically matches the saved bank id
+                      // Only auto-resume if the URL matches the saved bank id
                       setSelectedBankId(parsed.bankId);
                       setQuestions(parsed.questions);
                       setSelectedAnswers(parsed.selectedAnswers || {});
@@ -1185,7 +1185,9 @@ ${incorrectStudyQs.map((q: any, i: number) => `سؤال: ${q.text}\nالصح: ${
           return (
               <div className="min-h-screen bg-[#F8F9FA] text-[#1A1A1A] flex flex-col p-6 font-sans items-center" dir="rtl">
                   <header className="w-full max-w-4xl flex justify-between items-center mb-10 mt-10">
-                      <h1 className="text-4xl font-serif italic text-[#D4AF37] tracking-wider drop-shadow-sm" style={{ fontFamily: '"Aref Ruqaa", serif' }}>تمريضيانو</h1>
+                      <h1 className="text-4xl font-serif italic text-[#D4AF37] tracking-wider drop-shadow-sm flex items-center gap-2" style={{ fontFamily: '"Aref Ruqaa", serif' }}>
+                        <span>تمريضيانو</span>
+                      </h1>
                       <button onClick={() => { logout(); navigate('/login'); }} className="text-gray-500 hover:text-red-500 text-sm font-bold bg-white border border-gray-200 shadow-sm px-4 py-2 rounded-xl transition-all">
                           تسجيل خروج
                       </button>
@@ -1216,46 +1218,51 @@ ${incorrectStudyQs.map((q: any, i: number) => `سؤال: ${q.text}\nالصح: ${
                                           setIsFinished(false);
                                           setStartTime(Date.now());
                                       }}
-                                      className="bg-white p-6 rounded-2xl border-2 border-red-200 shadow-sm hover:shadow-md hover:border-red-500 transition-all text-right group flex items-start gap-4 w-full relative overflow-hidden cursor-pointer"
+                                      className="bg-white p-6 rounded-2xl border-2 border-red-200 shadow-sm hover:shadow-md hover:border-red-500 transition-all text-right group flex flex-col sm:flex-row items-start justify-between gap-4 w-full relative overflow-hidden cursor-pointer"
                                   >
                                       <div className="absolute top-0 right-0 w-2 h-full bg-red-400" />
-                                      <div className="w-14 h-14 bg-red-50 group-hover:bg-red-100 text-red-500 group-hover:text-red-700 rounded-xl flex items-center justify-center transition-colors flex-shrink-0">
-                                          <BookX size={28} />
+                                      <div className="flex items-start gap-4 flex-1">
+                                          <div className="w-14 h-14 bg-red-50 group-hover:bg-red-100 text-red-500 group-hover:text-red-700 rounded-xl flex items-center justify-center transition-colors flex-shrink-0">
+                                              <BookX size={28} />
+                                          </div>
+                                          <div>
+                                              <h3 className="font-bold text-gray-900 mb-1 text-lg">كشكول أخطائي ({mistakes.length} سؤال)</h3>
+                                              <p className="text-sm text-gray-500">تم تجميع الأسئلة التي تعثرت بها مسبقاً في مكان واحد. راجعها ليلة الامتحان!</p>
+                                          </div>
                                       </div>
-                                      <div>
-                                          <h3 className="font-bold text-gray-900 mb-1 text-lg">كشكول أخطائي ({mistakes.length} سؤال)</h3>
-                                          <p className="text-sm text-gray-500">تم تجميع الأسئلة التي تعثرت بها مسبقاً في مكان واحد. راجعها ليلة الامتحان!</p>
+                                      
+                                      <div className="flex items-center gap-2 self-end sm:self-center shrink-0 z-10 relative mt-2 sm:mt-0">
+                                          <button 
+                                              onClick={async (e) => {
+                                                  e.stopPropagation();
+                                                  try {
+                                                      const newMistakesDoc = await addDoc(collection(db, 'shared_mistakes'), { questions: mistakes, createdAt: serverTimestamp() });
+                                                      const shareUrl = `${window.location.origin}${window.location.pathname}?mistakes=${newMistakesDoc.id}`;
+                                                      await navigator.clipboard.writeText(shareUrl);
+                                                      alert('تم نسخ رابط بنك الأخطاء المشترك إلى الحافظة! يمكنك مشاركته الآن مع زملائك.');
+                                                  } catch(err) {
+                                                      alert('فشلت عملية المشاركة. تحقق من اتصالك بالإنترنت.');
+                                                  }
+                                              }}
+                                              className="p-2 text-blue-500 hover:text-blue-700 hover:bg-blue-100 rounded-full transition-colors cursor-pointer"
+                                              title="مشاركة كشكول الأخطاء كبنك تدريب"
+                                          >
+                                              <Share2 size={18} />
+                                          </button>
+                                          <button 
+                                              onClick={(e) => {
+                                                  e.stopPropagation();
+                                                  if(confirm('هل أنت متأكد من مسح جميع الأسئلة من كشكول الأخطاء؟')) {
+                                                      localStorage.removeItem(mistakesKey);
+                                                      window.location.reload();
+                                                  }
+                                              }}
+                                              className="p-2 text-red-400 hover:text-red-700 hover:bg-red-100 rounded-full transition-colors cursor-pointer"
+                                              title="تنظيف كشكول الأخطاء"
+                                          >
+                                              <Trash size={18} />
+                                          </button>
                                       </div>
-                                      <button 
-                                          onClick={(e) => {
-                                              e.stopPropagation();
-                                              if(confirm('هل أنت متأكد من مسح جميع الأسئلة من كشكول الأخطاء؟')) {
-                                                  localStorage.removeItem(mistakesKey);
-                                                  window.location.reload();
-                                              }
-                                          }}
-                                          className="absolute top-4 left-4 p-2 text-red-400 hover:text-red-700 hover:bg-red-100 rounded-full transition-colors cursor-pointer"
-                                          title="تنظيف كشكول الأخطاء"
-                                      >
-                                          <Trash size={18} />
-                                      </button>
-                                      <button 
-                                          onClick={async (e) => {
-                                              e.stopPropagation();
-                                              try {
-                                                  const newMistakesDoc = await addDoc(collection(db, 'shared_mistakes'), { questions: mistakes, createdAt: serverTimestamp() });
-                                                  const shareUrl = `${window.location.origin}${window.location.pathname}?mistakes=${newMistakesDoc.id}`;
-                                                  await navigator.clipboard.writeText(shareUrl);
-                                                  alert('تم نسخ رابط بنك الأخطاء المشترك إلى الحافظة! يمكنك مشاركته الآن مع زملائك.');
-                                              } catch(err) {
-                                                  alert('فشلت عملية المشاركة. تحقق من اتصالك بالإنترنت.');
-                                              }
-                                          }}
-                                          className="absolute top-4 left-14 p-2 text-blue-500 hover:text-blue-700 hover:bg-blue-100 rounded-full transition-colors cursor-pointer"
-                                          title="مشاركة كشكول الأخطاء كبنك تدريب"
-                                      >
-                                          <Share2 size={18} />
-                                      </button>
                                   </div>
                                   <div className="w-full border-t border-gray-200 my-6"></div>
                               </div>
@@ -1792,7 +1799,9 @@ ${incorrectStudyQs.map((q: any, i: number) => `سؤال: ${q.text}\nالصح: ${
             <button onClick={() => { setSelectedBankId(null); setQuestions([]); }} className="bg-gray-100 hover:bg-gray-200 text-gray-700 p-2 rounded-full transition-colors shadow-sm">
                 <ChevronRight size={16} />
             </button>
-            <h1 className="text-2xl font-serif italic text-[#D4AF37] tracking-wider drop-shadow-sm" style={{ fontFamily: '"Aref Ruqaa", serif' }}>تمريضيانو</h1>
+            <h1 className="text-2xl font-serif italic text-[#D4AF37] tracking-wider drop-shadow-sm flex items-center gap-2" style={{ fontFamily: '"Aref Ruqaa", serif' }}>
+              <span>تمريضيانو</span>
+            </h1>
         </div>
         <div className="flex items-center gap-2 sm:gap-4 text-xs font-mono font-bold text-gray-600 flex-wrap justify-end">
            {timeRemaining !== null && (
@@ -1802,9 +1811,6 @@ ${incorrectStudyQs.map((q: any, i: number) => `سؤال: ${q.text}\nالصح: ${
            )}
            <button onClick={() => setShowSettings(true)} className="flex text-[10px] bg-gray-50 hover:bg-gray-100 border border-gray-200 text-gray-600 px-2 sm:px-3 py-1 sm:py-1.5 rounded-full transition-all shadow-sm items-center gap-1 shrink-0">
              <Settings size={12}/> <span className="hidden sm:inline-block">الإعدادات</span>
-           </button>
-           <button onClick={() => setShowAdminUpgrade(true)} className="flex text-[10px] bg-gray-50 hover:bg-gray-100 border border-gray-200 text-gray-600 px-2 sm:px-3 py-1 sm:py-1.5 rounded-full transition-all shadow-sm items-center shrink-0">
-             <span>إدارة</span>
            </button>
            <span className="shrink-0">{Math.round(((currentIndex) / questions.length) * 100)}%</span>
         </div>
@@ -1854,26 +1860,26 @@ ${incorrectStudyQs.map((q: any, i: number) => `سؤال: ${q.text}\nالصح: ${
             exit={{ opacity: 0, x: 20 }}
             className="bg-white rounded-2xl p-6 shadow-[0_10px_40px_-10px_rgba(0,0,0,0.05)] border border-gray-100"
           >
-            <div className="flex justify-between items-start mb-6">
+            <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-6">
               <span className="px-3 py-1 rounded-full bg-gray-50 text-gray-600 border border-gray-200 text-[10px] font-bold uppercase tracking-widest shadow-sm">السؤال {String(currentIndex + 1).padStart(2, '0')}</span>
-              <div className="flex gap-2">
+              <div className="flex flex-wrap gap-2 justify-end mt-2 sm:mt-0">
                   <button 
                     onClick={() => setShowSupportChat(true)}
-                    className="flex items-center gap-2 text-xs font-bold px-3 py-1 rounded-lg border text-blue-600 hover:text-blue-800 bg-white border-blue-200 hover:bg-blue-50 transition-all shadow-sm"
+                    className="flex text-[10px] sm:text-xs items-center gap-1 sm:gap-2 font-bold px-2 sm:px-3 py-1 rounded-lg border text-blue-600 hover:text-blue-800 bg-white border-blue-200 hover:bg-blue-50 transition-all shadow-sm"
                   >
                     <Headset size={14} />
-                    <span>المركز الفني الذكي</span>
+                    <span>المركز الذكي</span>
                   </button>
                   <button 
                     onClick={() => setShowReportModal(true)}
-                    className="flex items-center gap-2 text-xs font-bold px-3 py-1 rounded-lg border text-red-500 hover:text-red-700 bg-white border-red-200 hover:bg-red-50 transition-all shadow-sm"
+                    className="flex text-[10px] sm:text-xs items-center gap-1 sm:gap-2 font-bold px-2 sm:px-3 py-1 rounded-lg border text-red-500 hover:text-red-700 bg-white border-red-200 hover:bg-red-50 transition-all shadow-sm"
                   >
                     <AlertTriangle size={14} />
                     <span>إبلاغ</span>
                   </button>
                   <button 
                     onClick={() => toggleBookmark(currentQ.id)}
-                    className={cn("flex items-center gap-2 text-xs font-bold px-3 py-1 rounded-lg border transition-all shadow-sm", bookmarked[currentQ.id] ? "text-[#D4AF37] bg-yellow-50 border-[#D4AF37]/30" : "text-gray-500 hover:text-gray-700 bg-white border-gray-200 hover:bg-gray-50")}
+                    className={cn("flex text-[10px] sm:text-xs items-center gap-1 sm:gap-2 font-bold px-2 sm:px-3 py-1 rounded-lg border transition-all shadow-sm", bookmarked[currentQ.id] ? "text-[#D4AF37] bg-yellow-50 border-[#D4AF37]/30" : "text-gray-500 hover:text-gray-700 bg-white border-gray-200 hover:bg-gray-50")}
                   >
                     <Bookmark size={14} className={bookmarked[currentQ.id] ? "fill-current" : ""} />
                     <span>حفظ للمراجعة</span>
@@ -2234,32 +2240,7 @@ ${incorrectStudyQs.map((q: any, i: number) => `سؤال: ${q.text}\nالصح: ${
          )}
       </AnimatePresence>
 
-      {/* Mobile Bottom Navigation Bar */}
-      <div className="md:hidden fixed bottom-0 left-0 right-0 z-[35] bg-white border-t border-gray-200 flex items-center justify-between pb-4 pt-2 px-6 shadow-[0_-10px_30px_-10px_rgba(0,0,0,0.1)]">
-         <button onClick={() => setCurrentIndex(Math.max(0, currentIndex - 1))} disabled={currentIndex === 0} className="p-3 text-gray-500 hover:bg-gray-50 rounded-full transition-colors disabled:opacity-30">
-            <ChevronRight size={26} />
-         </button>
-         
-         <button onClick={() => {
-            quitExam();
-         }} className="flex flex-col items-center p-2 text-gray-400 hover:text-[#D4AF37] transition-colors rounded-xl">
-            <LayoutList size={22} />
-            <span className="text-[10px] font-bold mt-1">البنوك</span>
-         </button>
 
-         <button onClick={() => setIsChatOpen(true)} className="relative flex flex-col items-center p-2 text-white bg-gradient-to-tr from-[#D4AF37] to-[#C5A059] rounded-2xl shadow-lg -mt-10 border-[4px] border-[#F8F9FA] hover:scale-105 transition-transform">
-            <Bot size={28} className="m-1.5" />
-         </button>
-
-         <button onClick={() => setShowSettings(true)} className="flex flex-col items-center p-2 text-gray-400 hover:text-[#D4AF37] transition-colors rounded-xl">
-            <Settings size={22} />
-            <span className="text-[10px] font-bold mt-1">إعدادات</span>
-         </button>
-         
-         <button onClick={() => setCurrentIndex(Math.min(questions.length - 1, currentIndex + 1))} disabled={currentIndex === questions.length - 1} className="p-3 text-gray-500 hover:bg-gray-50 rounded-full transition-colors disabled:opacity-30">
-            <ChevronLeft size={26} />
-         </button>
-      </div>
 
       {/* Report Modal */}
       {showReportModal && (

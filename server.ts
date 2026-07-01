@@ -98,9 +98,9 @@ async function startServer() {
       }
 
       let systemInstruction = `You are a concise, accurate AI medical tutor for Tamrediano. 
-Speak strictly in friendly Egyptian Arabic. Your language must be VERY SIMPLE, clear, and easy to understand for nursing students. 
+Speak strictly in friendly Egyptian Arabic mixed with simple terms, and occasionally add a playful phrase like "المركز الفني في البنك مش بيرد" if suitable. Your language must be VERY SIMPLE, clear, and easy to understand for nursing students. 
 Avoid complex medical jargon where possible, and explain things using everyday analogies. Keep it EXTREMELY SHORT, DIRECT, and SUMMARIZED (ما قل ودل). DO NOT talk too much. Get straight to the point.
-Never invent facts, numbers, or books. ONLY cite a book/page if it is explicitly provided in the question's explanation or reference text. Do NOT hallucinate information. If you don't know, say you don't know.`;
+CRITICAL: Never invent facts, hallucinate numbers, or modify values from copied text. If you receive copied text, strictly use the numbers found in it. ONLY cite a book/page if it is explicitly provided. If you don't know, say you don't know.`;
 
       if (referenceBook) {
         systemInstruction += `\n\nCRITICAL CONTEXT / SUBJECT BOOK REFERENCE (Please answer the student's question strictly according to this subject matter and medical information):\n${referenceBook}\n`;
@@ -168,14 +168,18 @@ Never invent facts, numbers, or books. ONLY cite a book/page if it is explicitly
       const { text, count, type, fileData, mimeType } = req.body;
       const systemInstruction = `You are an expert medical exam creator. Extract exactly ${count} ${type} questions from the provided text or document.
 The questions and choices MUST be in English.
-The explanation MUST be in friendly Egyptian Arabic, and MUST end with a citation of the exact source page/section from the uploaded document.
-Output MUST be a JSON array of objects without markdown blocks. Do NOT return \`\`\`json. Structure:
+The explanation MUST be in friendly Egyptian Arabic, mixed with some simple terms. Also occasionally add a playful joke like "شكل المركز الفني في البنك مش بيرد" to keep it light. The explanation MUST end with a citation of the exact source page/section from the uploaded document.
+CRITICAL: DO NOT invent or hallucinate any numbers or facts. If text is copied, stick strictly to the exact numbers in the text. 
+CRITICAL RULES for JSON:
+1. Output MUST be a JSON array of objects without markdown blocks.
+2. "correct" MUST be the exact integer index (0, 1, 2, or 3) indicating the true correct option in the "options" array. Double-check that this index accurately maps to the correct answer.
+Structure:
 [
   {
     "text": "The English question text",
     "options": ["Option A", "Option B", "Option C", "Option D"],
     "correct": 0,
-    "explanation": "Explanation in friendly Egyptian Arabic, ending with Source: Page X."
+    "explanation": "شرح بالمصري مع مصطلحات بسيطة..، المصدر: صفحة X"
   }
 ]`;
 
@@ -194,7 +198,8 @@ Output MUST be a JSON array of objects without markdown blocks. Do NOT return \`
             { role: "user", parts: userParts }
         ],
         config: {
-            responseMimeType: "application/json"
+            responseMimeType: "application/json",
+            maxOutputTokens: 8192
         }
       });
       if (usedConfig) await recordKeyUsage(usedConfig.feature, usedConfig.keyUsed);
@@ -202,6 +207,10 @@ Output MUST be a JSON array of objects without markdown blocks. Do NOT return \`
       let data;
       try {
         data = safeJsonParseArray(response.text);
+        // Force the count to respect the AI output precisely if it over-generated
+        if (Array.isArray(data) && data.length > parseInt(count)) {
+            data = data.slice(0, parseInt(count));
+        }
       } catch (e) {
         return res.status(500).json({ error: "فشل في تحليل الاستجابة بسبب كبر الحجم." });
       }

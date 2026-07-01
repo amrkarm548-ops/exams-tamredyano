@@ -8,11 +8,30 @@ import { useEffect, useState } from 'react';
 import Splash from './pages/Splash';
 import Login from './pages/Login';
 import Exam from './pages/Exam';
+import MobileSplash from './pages/mobile/MobileSplash';
+import MobileLogin from './pages/mobile/MobileLogin';
+import MobileExam from './pages/mobile/MobileExam';
 import AdminLogin from './pages/AdminLogin';
 import AdminDashboard from './pages/AdminDashboard';
 import { db, handleFirestoreError, OperationType, isFirebasePlaceholder } from './lib/firebase';
 import { doc, onSnapshot } from 'firebase/firestore';
 import { Toaster, toast } from 'react-hot-toast';
+import { useIsMobile } from './hooks/useIsMobile';
+
+const SplashRouter = () => {
+  const isMobile = useIsMobile();
+  return isMobile ? <MobileSplash /> : <Splash />;
+};
+
+const LoginRouter = () => {
+  const isMobile = useIsMobile();
+  return isMobile ? <MobileLogin /> : <Login />;
+};
+
+const ExamRouter = () => {
+  const isMobile = useIsMobile();
+  return isMobile ? <MobileExam /> : <Exam />;
+};
 
 function AppWrapper({ children }: { children: React.ReactNode }) {
   const [maintenanceMode, setMaintenanceMode] = useState(false);
@@ -58,19 +77,28 @@ function AppWrapper({ children }: { children: React.ReactNode }) {
       handleFirestoreError(error, OperationType.GET, 'system/config');
     });
 
-    // Check ban status for current student
-    const studentData = localStorage.getItem('tamrediano_student');
+    // Check ban status for current student and device
     let unsubBan = () => {};
+    let unsubDeviceBan = () => {};
+
+    const checkBanStatus = (snapDoc: any) => {
+        if (snapDoc.exists() && snapDoc.data().banned) {
+            setBanned(true);
+        }
+    };
+
+    const studentData = localStorage.getItem('tamrediano_student');
     if (studentData) {
       const studentId = JSON.parse(studentData).id;
-      unsubBan = onSnapshot(doc(db, 'strikes', studentId), (docSnap) => {
-        if (docSnap.exists() && docSnap.data().banned) {
-          setBanned(true);
-        } else {
-          setBanned(false);
-        }
-      }, (error) => {
+      unsubBan = onSnapshot(doc(db, 'strikes', studentId), checkBanStatus, (error) => {
         handleFirestoreError(error, OperationType.GET, `strikes/${studentId}`);
+      });
+    }
+
+    const deviceId = localStorage.getItem('tamrediano_device_id');
+    if (deviceId) {
+      unsubDeviceBan = onSnapshot(doc(db, 'strikes', deviceId), checkBanStatus, (error) => {
+          handleFirestoreError(error, OperationType.GET, `strikes/${deviceId}`);
       });
     }
 
@@ -78,6 +106,7 @@ function AppWrapper({ children }: { children: React.ReactNode }) {
       unsubGlobal();
       unsubConfig();
       unsubBan();
+      unsubDeviceBan();
     };
   }, []);
 
@@ -177,11 +206,18 @@ function AppWrapper({ children }: { children: React.ReactNode }) {
   return (
       <div className="relative isolate w-full h-full">
           {globalAlert && (
-              <div dir="rtl" className="fixed top-0 left-0 right-0 bg-blue-600 text-white text-center py-2 px-4 shadow-md font-bold text-sm z-[9999] flex justify-center items-center gap-2 animate-pulse">
-                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-                  </svg>
-                  رسالة من الإدارة: {globalAlert}
+              <div dir="rtl" className="fixed top-6 left-1/2 -translate-x-1/2 max-w-lg w-[90%] bg-white/95 backdrop-blur-md text-red-600 rounded-2xl p-4 shadow-[0_20px_50px_-12px_rgba(220,38,38,0.25)] font-bold z-[9999] flex items-start sm:items-center gap-4 border border-red-100 animate-in fade-in slide-in-from-top-6 duration-500">
+                  <div className="bg-red-50 p-2.5 rounded-full shrink-0 relative">
+                     <svg className="w-5 h-5 text-red-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" />
+                     </svg>
+                     <div className="absolute top-0 right-0 w-2.5 h-2.5 bg-red-500 rounded-full border-2 border-red-50 animate-ping" />
+                     <div className="absolute top-0 right-0 w-2.5 h-2.5 bg-red-500 rounded-full border-2 border-red-50" />
+                  </div>
+                  <div className="flex flex-col text-right">
+                      <span className="text-[10px] text-red-400 font-black mb-1 tracking-wider">رسالة عاجلة من الإدارة</span>
+                      <span className="text-sm leading-snug">{globalAlert}</span>
+                  </div>
               </div>
           )}
           {children}
@@ -238,9 +274,9 @@ export default function App() {
     <BrowserRouter>
       <Toaster position="top-center" toastOptions={{ className: 'font-bold rtl', style: { borderRadius: '12px', padding: '16px', color: '#1A1A1A' } }} />
       <Routes>
-        <Route path="/" element={<AppWrapper><Splash /></AppWrapper>} />
-        <Route path="/login" element={<AppWrapper><Login /></AppWrapper>} />
-        <Route path="/exam" element={<AppWrapper><Exam /></AppWrapper>} />
+        <Route path="/" element={<AppWrapper><SplashRouter /></AppWrapper>} />
+        <Route path="/login" element={<AppWrapper><LoginRouter /></AppWrapper>} />
+        <Route path="/exam" element={<AppWrapper><ExamRouter /></AppWrapper>} />
         <Route path="/admin-login" element={<AdminLogin />} />
         <Route path="/admin-dashboard" element={<AdminDashboard />} />
       </Routes>
